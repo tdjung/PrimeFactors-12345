@@ -1,6 +1,6 @@
-// callgrind_generator_clean.hpp
-#ifndef CALLGRIND_GENERATOR_CLEAN_HPP
-#define CALLGRIND_GENERATOR_CLEAN_HPP
+// callgrind_generator_final.hpp
+#ifndef CALLGRIND_GENERATOR_FINAL_HPP
+#define CALLGRIND_GENERATOR_FINAL_HPP
 
 #include <iostream>
 #include <fstream>
@@ -34,8 +34,8 @@ enum EventType {
 enum class BranchType {
     NONE,
     BRANCH,           // Conditional branch (beq, bne, etc.)
-    DIRECT_JUMP,      // Direct unconditional jump (j, jal with x0)
-    INDIRECT_JUMP,    // Indirect jump (jalr with x0)
+    DIRECT_JUMP,      // Direct unconditional jump (j label)
+    INDIRECT_JUMP,    // Indirect jump (jalr x0, rs)
     CALL,             // Function call (jal, jalr with link)
     RETURN,           // Function return
     TAIL_CALL         // Tail call optimization
@@ -55,7 +55,7 @@ struct PCInfo {
     }
 };
 
-// Call record with inclusive costs
+// Call target information
 struct CallTarget {
     uint64_t target_pc;
     uint64_t count;
@@ -66,7 +66,7 @@ struct CallTarget {
     }
 };
 
-// Jump/Branch record
+// Jump target information
 struct JumpTarget {
     uint64_t target_pc;
     uint64_t executed;
@@ -77,11 +77,11 @@ struct JumpTarget {
 
 // Multiple targets from single PC
 struct CallSite {
-    std::vector<CallTarget> targets;  // Multiple targets for indirect calls
+    std::vector<CallTarget> targets;
 };
 
 struct BranchSite {
-    std::vector<JumpTarget> targets;  // Multiple targets for branches
+    std::vector<JumpTarget> targets;
 };
 
 // Call stack entry
@@ -162,17 +162,15 @@ private:
     
     // Runtime branch type detection based on execution flow
     BranchType detectBranchType(uint64_t from_pc, uint64_t to_pc, int dest_reg, bool is_sequential) {
-        // Sequential execution means no branch taken
-        if (is_sequential) {
-            return BranchType::NONE;
-        }
-        
         // Get function information
         auto from_it = info.find(from_pc);
         auto to_it = info.find(to_pc);
         
         if (from_it == info.end() || to_it == info.end()) {
-            // Default to direct jump for unknown
+            // For unknown code, assume conditional branch if not taken
+            if (is_sequential) {
+                return BranchType::BRANCH;
+            }
             return BranchType::DIRECT_JUMP;
         }
         
@@ -180,70 +178,54 @@ private:
         const std::string& to_func = to_it->second.func;
         
         // Check for return - jumping back to caller's context
-        if (!call_stack.empty()) {
+        if (!is_sequential && !call_stack.empty()) {
             const auto& stack_top = call_stack.top();
             auto caller_it = info.find(stack_top.caller_pc);
             if (caller_it != info.end()) {
-                // Check if returning to caller's function
                 if (to_func == caller_it->second.func) {
                     return BranchType::RETURN;
                 }
             }
         }
         
-        // Jumping to different function indicates call or tail call
-        if (from_func != to_func) {
-            // dest_reg determines if it's a call or tail call
-            // RISC-V: x0 (reg 0) means no return address saved
+        // Check if jumping to different function (only when actually taken)
+        if (!is_sequential && from_func != to_func) {
+            // Function call or tail call
             if (dest_reg == 0) {
                 return BranchType::TAIL_CALL;
             } else if (dest_reg > 0) {
                 return BranchType::CALL;
             }
-            // Unknown dest_reg: assume regular call
             return BranchType::CALL;
         }
         
-        // Same function jump - determine type
+        // Same function - determine branch/jump type
+        
+        // Sequential execution after branch instruction = not taken branch
+        if (is_sequential) {
+            return BranchType::BRANCH;  // Conditional branch, not taken
+        }
+        
+        // Non-sequential execution - branch/jump was taken
         // Backward jumps are typically conditional branches (loops)
         if (to_pc < from_pc) {
             return BranchType::BRANCH;
         }
         
-        // Forward jumps need more analysis
+        // Forward jumps - analyze distance
         uint64_t jump_distance = to_pc - from_pc;
         
         // Small forward jumps are often conditional branches
-        if (jump_distance <= 32) {  // Typical if-else distance
+        if (jump_distance <= 32) {
             return BranchType::BRANCH;
         }
         
-        // Large forward jumps are typically direct jumps (goto, break from loop)
-        // Without more info, assume direct jump
-        // Note: Simulator should provide hints for indirect jumps
+        // Large forward jumps are typically direct jumps
         return BranchType::DIRECT_JUMP;
     }
     
-    // Enhanced detection with branch type hint from simulator
-    BranchType detectBranchTypeWithHint(uint64_t from_pc, uint64_t to_pc, 
-                                        int dest_reg, bool is_sequential,
-                                        bool is_indirect) {
-        // Let simulator's hint override for indirect jumps
-        if (!is_sequential && is_indirect) {
-            // Check if it's an indirect call or jump
-            if (dest_reg > 0) {
-                return BranchType::CALL;  // Indirect call
-            } else {
-                return BranchType::INDIRECT_JUMP;  // Indirect jump
-            }
-        }
-        
-        // Fall back to regular detection
-        return detectBranchType(from_pc, to_pc, dest_reg, is_sequential);
-    }
-    
     // Handle detected branch/call
-    void handleBranch(uint64_t from_pc, uint64_t to_pc, BranchType type) {
+    void handleBranch(uint64_t from_pc, uint64_t to_pc, BranchType type, bool is_sequential = false) {
         switch (type) {
             case BranchType::CALL: {
                 // Regular function call - push to stack
@@ -261,7 +243,7 @@ private:
                 
                 call_stack.push(entry);
                 
-                // Record call - find or create target
+                // Record call (NOT jump)
                 auto& call_site = calls[from_pc];
                 auto target_it = std::find_if(call_site.targets.begin(), 
                                               call_site.targets.end(),
@@ -274,25 +256,6 @@ private:
                     new_target.target_pc = to_pc;
                     new_target.count = 1;
                     call_site.targets.push_back(new_target);
-                }
-                
-                // Track as jump if enabled
-                if (collect_jumps) {
-                    auto& branch_site = jumps[from_pc];
-                    auto jump_it = std::find_if(branch_site.targets.begin(),
-                                                branch_site.targets.end(),
-                        [to_pc](const JumpTarget& t) { return t.target_pc == to_pc; });
-                    
-                    if (jump_it != branch_site.targets.end()) {
-                        jump_it->executed++;
-                        jump_it->taken++;
-                    } else {
-                        JumpTarget new_jump;
-                        new_jump.target_pc = to_pc;
-                        new_jump.executed = 1;
-                        new_jump.taken = 1;
-                        branch_site.targets.push_back(new_jump);
-                    }
                 }
                 break;
             }
@@ -321,7 +284,7 @@ private:
                     call_stack.pop();
                     call_stack.push(tail_entry);
                     
-                    // Record tail call
+                    // Record tail call (NOT jump)
                     auto& call_site = calls[from_pc];
                     auto target_it = std::find_if(call_site.targets.begin(),
                                                   call_site.targets.end(),
@@ -334,24 +297,6 @@ private:
                         new_target.target_pc = to_pc;
                         new_target.count = 1;
                         call_site.targets.push_back(new_target);
-                    }
-                }
-                
-                if (collect_jumps) {
-                    auto& branch_site = jumps[from_pc];
-                    auto jump_it = std::find_if(branch_site.targets.begin(),
-                                                branch_site.targets.end(),
-                        [to_pc](const JumpTarget& t) { return t.target_pc == to_pc; });
-                    
-                    if (jump_it != branch_site.targets.end()) {
-                        jump_it->executed++;
-                        jump_it->taken++;
-                    } else {
-                        JumpTarget new_jump;
-                        new_jump.target_pc = to_pc;
-                        new_jump.executed = 1;
-                        new_jump.taken = 1;
-                        branch_site.targets.push_back(new_jump);
                     }
                 }
                 break;
@@ -412,37 +357,56 @@ private:
             case BranchType::INDIRECT_JUMP: {
                 if (collect_jumps) {
                     auto& branch_site = jumps[from_pc];
-                    auto jump_it = std::find_if(branch_site.targets.begin(),
-                                                branch_site.targets.end(),
-                        [to_pc](const JumpTarget& t) { return t.target_pc == to_pc; });
                     
-                    if (jump_it != branch_site.targets.end()) {
-                        jump_it->executed++;
-                        jump_it->taken++;
-                    } else {
-                        JumpTarget new_jump;
-                        new_jump.target_pc = to_pc;
-                        new_jump.executed = 1;
-                        new_jump.taken = 1;
-                        branch_site.targets.push_back(new_jump);
-                    }
-                    
-                    // Update branch statistics for conditional branches
+                    // For branches, we need to track both taken and not-taken
                     if (type == BranchType::BRANCH) {
+                        // Find or create target entry
+                        auto jump_it = std::find_if(branch_site.targets.begin(),
+                                                    branch_site.targets.end(),
+                            [to_pc](const JumpTarget& t) { return t.target_pc == to_pc; });
+                        
+                        if (jump_it != branch_site.targets.end()) {
+                            jump_it->executed++;
+                            if (!is_sequential) {  // Taken only if not sequential
+                                jump_it->taken++;
+                            }
+                        } else {
+                            JumpTarget new_jump;
+                            new_jump.target_pc = to_pc;
+                            new_jump.executed = 1;
+                            new_jump.taken = is_sequential ? 0 : 1;
+                            branch_site.targets.push_back(new_jump);
+                        }
+                        
+                        // Update branch statistics
                         info[from_pc].event[EVENT_BC]++;
-                        // Simple misprediction model
+                        // Simple misprediction model - if pattern changes
                         if (jump_it != branch_site.targets.end() &&
-                            jump_it->taken <= jump_it->executed / 2) {
+                            jump_it->taken != 0 && jump_it->taken != jump_it->executed) {
                             info[from_pc].event[EVENT_BCM]++;
                         }
-                    } else if (type == BranchType::INDIRECT_JUMP) {
-                        // Track indirect branch statistics
-                        info[from_pc].event[EVENT_BI]++;
-                        // Indirect branch misprediction (simplified)
-                        if (jump_it != branch_site.targets.end() &&
-                            branch_site.targets.size() > 1) {
-                            // Multiple targets = harder to predict
-                            info[from_pc].event[EVENT_BIM]++;
+                    } else {
+                        // Direct/Indirect jumps are always taken
+                        auto jump_it = std::find_if(branch_site.targets.begin(),
+                                                    branch_site.targets.end(),
+                            [to_pc](const JumpTarget& t) { return t.target_pc == to_pc; });
+                        
+                        if (jump_it != branch_site.targets.end()) {
+                            jump_it->executed++;
+                            jump_it->taken++;
+                        } else {
+                            JumpTarget new_jump;
+                            new_jump.target_pc = to_pc;
+                            new_jump.executed = 1;
+                            new_jump.taken = 1;
+                            branch_site.targets.push_back(new_jump);
+                        }
+                        
+                        if (type == BranchType::INDIRECT_JUMP) {
+                            info[from_pc].event[EVENT_BI]++;
+                            if (branch_site.targets.size() > 1) {
+                                info[from_pc].event[EVENT_BIM]++;
+                            }
                         }
                     }
                 }
@@ -525,9 +489,8 @@ public:
         if (last_pc != 0 && last_was_branch) {
             bool is_sequential = (pc == last_pc + last_inst_size);
             BranchType branch_type = detectBranchType(last_pc, pc, last_dest_reg, is_sequential);
-            if (branch_type != BranchType::NONE) {
-                handleBranch(last_pc, pc, branch_type);
-            }
+            // Always handle the branch
+            handleBranch(last_pc, pc, branch_type, is_sequential);
         }
         
         // Update state for next iteration
@@ -703,7 +666,6 @@ public:
                         }
                         
                         // For conditional branches, check if it was taken
-                        // Note: A branch site with multiple targets indicates taken/not-taken
                         bool is_conditional = (jump_it->second.targets.size() > 1) || 
                                             (jump.taken < jump.executed);
                         
@@ -718,45 +680,6 @@ public:
                         }
                         out << "/" << target_fn << " " << jump.taken << "\n";
                     }
-                }
-            }
-        }
-        
-        // Summary
-        // (Some tools prefer this format, though inline is more common)
-        bool write_separate_callgraph = false;  // Set to true if needed
-        
-        if (write_separate_callgraph) {
-            out << "\n# Call graph\n";
-            for (const auto& [key, call] : calls) {
-                auto caller_it = info.find(key.first);
-                auto callee_it = info.find(key.second);
-                
-                if (caller_it != info.end()) {
-                    out << "fn=" << caller_it->second.func << "\n";
-                    out << "fl=" << caller_it->second.file << "\n";
-                    
-                    if (callee_it != info.end()) {
-                        out << "cfn=" << callee_it->second.func << "\n";
-                        out << "cfl=" << callee_it->second.file << "\n";
-                    }
-                    
-                    out << "calls=" << call.count << " ";
-                    if (dump_instr) {
-                        out << "0x" << std::hex << key.second << std::dec;
-                    }
-                    out << " " << (callee_it != info.end() ? callee_it->second.line : 0) << "\n";
-                    
-                    // Output inclusive costs
-                    if (dump_instr) {
-                        out << "0x" << std::hex << key.first << std::dec;
-                    }
-                    out << " " << caller_it->second.line;
-                    
-                    for (size_t i = 0; i < num_events; ++i) {
-                        out << " " << call.inclusive_events[i];
-                    }
-                    out << "\n\n";
                 }
             }
         }
@@ -814,37 +737,4 @@ public:
     }
 };
 
-// Usage example
-/*
-int main() {
-    SimulatorInterface sim("output.callgrind");
-    
-    // Load symbol information from objdump
-    std::vector<std::tuple<uint64_t, std::string, std::string, std::string, uint32_t>> objdump_data = {
-        {0x1000, "main", "addi sp,sp,-16", "main.c", 10},
-        {0x1004, "main", "jal ra,0x2000", "main.c", 11},
-        {0x1008, "main", "addi sp,sp,16", "main.c", 12},
-        {0x100c, "main", "ret", "main.c", 13},
-        {0x2000, "func1", "addi a0,a0,1", "func.c", 20},
-        {0x2004, "func1", "j 0x3000", "func.c", 21},  // tail call
-        {0x3000, "func2", "addi a0,a0,2", "func.c", 30},
-        {0x3004, "func2", "ret", "func.c", 31},
-    };
-    sim.loadObjdumpData(objdump_data);
-    
-    // Simulate execution
-    sim.onInstruction(0x1000, EVENT_IR, 1, -1, false);  // addi
-    sim.onInstruction(0x1004, EVENT_IR, 1, 1, true);    // jal ra (call)
-    sim.onInstruction(0x2000, EVENT_IR, 1, -1, false);  // addi in func1
-    sim.onInstruction(0x2004, EVENT_IR, 1, 0, true);    // j (tail call with x0)
-    sim.onInstruction(0x3000, EVENT_IR, 1, -1, false);  // addi in func2
-    sim.onInstruction(0x3004, EVENT_IR, 1, -1, true);   // ret
-    sim.onInstruction(0x1008, EVENT_IR, 1, -1, false);  // back to main
-    sim.onInstruction(0x100c, EVENT_IR, 1, -1, true);   // ret from main
-    
-    sim.finalize();
-    return 0;
-}
-*/
-
-#endif // CALLGRIND_GENERATOR_CLEAN_HPP
+#endif // CALLGRIND_GENERATOR_FINAL_HPP
