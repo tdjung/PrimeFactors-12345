@@ -55,25 +55,32 @@ struct PCInfo {
 };
 
 // Call record with inclusive costs
-struct CallRecord {
-    uint64_t caller_pc;
-    uint64_t callee_pc;
+struct CallTarget {
+    uint64_t target_pc;
     uint64_t count;
     uint64_t inclusive_events[MAX_EVENTS];
     
-    CallRecord() : caller_pc(0), callee_pc(0), count(0) {
+    CallTarget() : target_pc(0), count(0) {
         std::fill(std::begin(inclusive_events), std::end(inclusive_events), 0);
     }
 };
 
 // Jump/Branch record
-struct JumpRecord {
-    uint64_t source_pc;
+struct JumpTarget {
     uint64_t target_pc;
     uint64_t executed;
     uint64_t taken;
     
-    JumpRecord() : source_pc(0), target_pc(0), executed(0), taken(0) {}
+    JumpTarget() : target_pc(0), executed(0), taken(0) {}
+};
+
+// Multiple targets from single PC
+struct CallSite {
+    std::vector<CallTarget> targets;  // Multiple targets for indirect calls
+};
+
+struct BranchSite {
+    std::vector<JumpTarget> targets;  // Multiple targets for branches
 };
 
 // Call stack entry
@@ -91,9 +98,9 @@ private:
     // Main data structure
     std::unordered_map<uint64_t, PCInfo> info;
     
-    // Call and jump tracking
-    std::map<std::pair<uint64_t, uint64_t>, CallRecord> calls;
-    std::map<std::pair<uint64_t, uint64_t>, JumpRecord> jumps;
+    // Call and jump tracking - PC as primary key for fast lookup
+    std::unordered_map<uint64_t, CallSite> calls;   // from_pc -> multiple targets
+    std::unordered_map<uint64_t, BranchSite> jumps; // from_pc -> multiple targets
     
     // Runtime state
     std::stack<CallStackEntry> call_stack;
@@ -228,19 +235,38 @@ private:
                 
                 call_stack.push(entry);
                 
-                // Record call
-                auto& call = calls[{from_pc, to_pc}];
-                call.caller_pc = from_pc;
-                call.callee_pc = to_pc;
-                call.count++;
+                // Record call - find or create target
+                auto& call_site = calls[from_pc];
+                auto target_it = std::find_if(call_site.targets.begin(), 
+                                              call_site.targets.end(),
+                    [to_pc](const CallTarget& t) { return t.target_pc == to_pc; });
+                
+                if (target_it != call_site.targets.end()) {
+                    target_it->count++;
+                } else {
+                    CallTarget new_target;
+                    new_target.target_pc = to_pc;
+                    new_target.count = 1;
+                    call_site.targets.push_back(new_target);
+                }
                 
                 // Track as jump if enabled
                 if (collect_jumps) {
-                    auto& jump = jumps[{from_pc, to_pc}];
-                    jump.source_pc = from_pc;
-                    jump.target_pc = to_pc;
-                    jump.executed++;
-                    jump.taken++;
+                    auto& branch_site = jumps[from_pc];
+                    auto jump_it = std::find_if(branch_site.targets.begin(),
+                                                branch_site.targets.end(),
+                        [to_pc](const JumpTarget& t) { return t.target_pc == to_pc; });
+                    
+                    if (jump_it != branch_site.targets.end()) {
+                        jump_it->executed++;
+                        jump_it->taken++;
+                    } else {
+                        JumpTarget new_jump;
+                        new_jump.target_pc = to_pc;
+                        new_jump.executed = 1;
+                        new_jump.taken = 1;
+                        branch_site.targets.push_back(new_jump);
+                    }
                 }
                 break;
             }
@@ -270,18 +296,37 @@ private:
                     call_stack.push(tail_entry);
                     
                     // Record tail call
-                    auto& call = calls[{from_pc, to_pc}];
-                    call.caller_pc = from_pc;
-                    call.callee_pc = to_pc;
-                    call.count++;
+                    auto& call_site = calls[from_pc];
+                    auto target_it = std::find_if(call_site.targets.begin(),
+                                                  call_site.targets.end(),
+                        [to_pc](const CallTarget& t) { return t.target_pc == to_pc; });
+                    
+                    if (target_it != call_site.targets.end()) {
+                        target_it->count++;
+                    } else {
+                        CallTarget new_target;
+                        new_target.target_pc = to_pc;
+                        new_target.count = 1;
+                        call_site.targets.push_back(new_target);
+                    }
                 }
                 
                 if (collect_jumps) {
-                    auto& jump = jumps[{from_pc, to_pc}];
-                    jump.source_pc = from_pc;
-                    jump.target_pc = to_pc;
-                    jump.executed++;
-                    jump.taken++;
+                    auto& branch_site = jumps[from_pc];
+                    auto jump_it = std::find_if(branch_site.targets.begin(),
+                                                branch_site.targets.end(),
+                        [to_pc](const JumpTarget& t) { return t.target_pc == to_pc; });
+                    
+                    if (jump_it != branch_site.targets.end()) {
+                        jump_it->executed++;
+                        jump_it->taken++;
+                    } else {
+                        JumpTarget new_jump;
+                        new_jump.target_pc = to_pc;
+                        new_jump.executed = 1;
+                        new_jump.taken = 1;
+                        branch_site.targets.push_back(new_jump);
+                    }
                 }
                 break;
             }
@@ -297,23 +342,34 @@ private:
                         inclusive_cost[i] = accumulated_events[i] - entry.events_at_entry[i];
                     }
                     
-                    // Update call record
-                    auto call_key = std::make_pair(entry.caller_pc, entry.callee_pc);
-                    auto call_it = calls.find(call_key);
+                    // Update call record - find the call site and target
+                    auto call_it = calls.find(entry.caller_pc);
                     if (call_it != calls.end()) {
-                        for (size_t i = 0; i < MAX_EVENTS; ++i) {
-                            call_it->second.inclusive_events[i] += inclusive_cost[i];
+                        auto target_it = std::find_if(call_it->second.targets.begin(),
+                                                      call_it->second.targets.end(),
+                            [&entry](const CallTarget& t) { return t.target_pc == entry.callee_pc; });
+                        
+                        if (target_it != call_it->second.targets.end()) {
+                            for (size_t i = 0; i < MAX_EVENTS; ++i) {
+                                target_it->inclusive_events[i] += inclusive_cost[i];
+                            }
                         }
                     }
                     
                     // Handle tail call chain costs
                     if (entry.is_tail_call && !tail_call_chain.empty()) {
                         for (const auto& [tail_from, tail_to] : tail_call_chain) {
-                            auto tail_call_it = calls.find({tail_from, tail_to});
+                            auto tail_call_it = calls.find(tail_from);
                             if (tail_call_it != calls.end()) {
-                                for (size_t i = 0; i < MAX_EVENTS; ++i) {
-                                    tail_call_it->second.inclusive_events[i] += 
-                                        inclusive_cost[i] / (tail_call_chain.size() + 1);
+                                auto target_it = std::find_if(tail_call_it->second.targets.begin(),
+                                                             tail_call_it->second.targets.end(),
+                                    [tail_to](const CallTarget& t) { return t.target_pc == tail_to; });
+                                
+                                if (target_it != tail_call_it->second.targets.end()) {
+                                    for (size_t i = 0; i < MAX_EVENTS; ++i) {
+                                        target_it->inclusive_events[i] += 
+                                            inclusive_cost[i] / (tail_call_chain.size() + 1);
+                                    }
                                 }
                             }
                         }
@@ -328,17 +384,28 @@ private:
             case BranchType::CONDITIONAL_BRANCH:
             case BranchType::UNCONDITIONAL_BRANCH: {
                 if (collect_jumps) {
-                    auto& jump = jumps[{from_pc, to_pc}];
-                    jump.source_pc = from_pc;
-                    jump.target_pc = to_pc;
-                    jump.executed++;
-                    jump.taken++;
+                    auto& branch_site = jumps[from_pc];
+                    auto jump_it = std::find_if(branch_site.targets.begin(),
+                                                branch_site.targets.end(),
+                        [to_pc](const JumpTarget& t) { return t.target_pc == to_pc; });
+                    
+                    if (jump_it != branch_site.targets.end()) {
+                        jump_it->executed++;
+                        jump_it->taken++;
+                    } else {
+                        JumpTarget new_jump;
+                        new_jump.target_pc = to_pc;
+                        new_jump.executed = 1;
+                        new_jump.taken = 1;
+                        branch_site.targets.push_back(new_jump);
+                    }
                     
                     // Update branch statistics
                     if (type == BranchType::CONDITIONAL_BRANCH) {
                         info[from_pc].event[EVENT_BC]++;
                         // Simple misprediction model
-                        if (jump.taken <= jump.executed / 2) {
+                        if (jump_it != branch_site.targets.end() &&
+                            jump_it->taken <= jump_it->executed / 2) {
                             info[from_pc].event[EVENT_BCM]++;
                         }
                     }
@@ -437,38 +504,6 @@ public:
             last_inst_size = detectInstructionSize(it->second.assembly);
         } else {
             last_inst_size = 4;  // Default
-        }
-    }
-    
-    // Batch recording interface
-    void recordExecutionMulti(uint64_t pc, const uint64_t* events, size_t event_count, 
-                             int dest_reg = -1, bool is_branch_instruction = false) {
-        // Update all events
-        for (size_t i = 0; i < event_count && i < MAX_EVENTS; ++i) {
-            if (events[i] > 0) {
-                info[pc].event[i] += events[i];
-                accumulated_events[i] += events[i];
-            }
-        }
-        
-        // Handle control flow
-        if (last_pc != 0 && last_was_branch) {
-            bool is_sequential = (pc == last_pc + last_inst_size);
-            BranchType branch_type = detectBranchType(last_pc, pc, last_dest_reg, is_sequential);
-            if (branch_type != BranchType::NONE) {
-                handleBranch(last_pc, pc, branch_type);
-            }
-        }
-        
-        last_pc = pc;
-        last_dest_reg = dest_reg;
-        last_was_branch = is_branch_instruction;
-        
-        auto it = info.find(pc);
-        if (it != info.end() && !it->second.assembly.empty()) {
-            last_inst_size = detectInstructionSize(it->second.assembly);
-        } else {
-            last_inst_size = 4;
         }
     }
     
@@ -577,7 +612,7 @@ public:
             }
             last_line = pc_info.line;
             
-            // Output events
+            // Output events (self cost only)
             for (size_t i = 0; i < num_events; ++i) {
                 out << " " << pc_info.event[i];
             }
@@ -588,12 +623,45 @@ public:
             }
             out << "\n";
             
-            // Output jumps
+            // Output call information inline if this PC is a call site
+            auto call_it = calls.find(pc);
+            if (call_it != calls.end()) {
+                // Output each target for this call site
+                for (const auto& target : call_it->second.targets) {
+                    auto callee_it = info.find(target.target_pc);
+                    if (callee_it != info.end()) {
+                        out << "cfn=" << callee_it->second.func << "\n";
+                        out << "cfl=" << callee_it->second.file << "\n";
+                    } else {
+                        out << "cfn=unknown\n";
+                    }
+                    
+                    out << "calls=" << target.count << " ";
+                    if (dump_instr) {
+                        out << "0x" << std::hex << target.target_pc << std::dec;
+                    }
+                    out << " " << (callee_it != info.end() ? callee_it->second.line : 0) << "\n";
+                    
+                    // Output inclusive costs at call site
+                    if (dump_instr) {
+                        out << "0x" << std::hex << pc << std::dec;
+                    }
+                    out << " " << pc_info.line;
+                    for (size_t i = 0; i < num_events; ++i) {
+                        out << " " << target.inclusive_events[i];
+                    }
+                    out << "\n";
+                }
+            }
+            
+            // Output jumps inline
             if (collect_jumps) {
-                for (const auto& [key, jump] : jumps) {
-                    if (key.first == pc) {
+                auto jump_it = jumps.find(pc);
+                if (jump_it != jumps.end()) {
+                    // Output each jump target
+                    for (const auto& jump : jump_it->second.targets) {
                         std::string target_fn = "unknown";
-                        auto target_it = info.find(key.second);
+                        auto target_it = info.find(jump.target_pc);
                         if (target_it != info.end()) {
                             target_fn = target_it->second.func;
                         }
@@ -608,7 +676,7 @@ public:
                         }
                         
                         if (dump_instr) {
-                            out << "0x" << std::hex << key.second << std::dec;
+                            out << "0x" << std::hex << jump.target_pc << std::dec;
                         }
                         out << "/" << target_fn << " " << jump.taken << "\n";
                     }
@@ -616,37 +684,42 @@ public:
             }
         }
         
-        // Write call graph
-        out << "\n# Call graph\n";
-        for (const auto& [key, call] : calls) {
-            auto caller_it = info.find(key.first);
-            auto callee_it = info.find(key.second);
-            
-            if (caller_it != info.end()) {
-                out << "fn=" << caller_it->second.func << "\n";
-                out << "fl=" << caller_it->second.file << "\n";
+        // Summary
+        // (Some tools prefer this format, though inline is more common)
+        bool write_separate_callgraph = false;  // Set to true if needed
+        
+        if (write_separate_callgraph) {
+            out << "\n# Call graph\n";
+            for (const auto& [key, call] : calls) {
+                auto caller_it = info.find(key.first);
+                auto callee_it = info.find(key.second);
                 
-                if (callee_it != info.end()) {
-                    out << "cfn=" << callee_it->second.func << "\n";
-                    out << "cfl=" << callee_it->second.file << "\n";
+                if (caller_it != info.end()) {
+                    out << "fn=" << caller_it->second.func << "\n";
+                    out << "fl=" << caller_it->second.file << "\n";
+                    
+                    if (callee_it != info.end()) {
+                        out << "cfn=" << callee_it->second.func << "\n";
+                        out << "cfl=" << callee_it->second.file << "\n";
+                    }
+                    
+                    out << "calls=" << call.count << " ";
+                    if (dump_instr) {
+                        out << "0x" << std::hex << key.second << std::dec;
+                    }
+                    out << " " << (callee_it != info.end() ? callee_it->second.line : 0) << "\n";
+                    
+                    // Output inclusive costs
+                    if (dump_instr) {
+                        out << "0x" << std::hex << key.first << std::dec;
+                    }
+                    out << " " << caller_it->second.line;
+                    
+                    for (size_t i = 0; i < num_events; ++i) {
+                        out << " " << call.inclusive_events[i];
+                    }
+                    out << "\n\n";
                 }
-                
-                out << "calls=" << call.count << " ";
-                if (dump_instr) {
-                    out << "0x" << std::hex << key.second << std::dec;
-                }
-                out << " " << (callee_it != info.end() ? callee_it->second.line : 0) << "\n";
-                
-                // Output inclusive costs
-                if (dump_instr) {
-                    out << "0x" << std::hex << key.first << std::dec;
-                }
-                out << " " << caller_it->second.line;
-                
-                for (size_t i = 0; i < num_events; ++i) {
-                    out << " " << call.inclusive_events[i];
-                }
-                out << "\n\n";
             }
         }
         
@@ -695,12 +768,6 @@ public:
     void onInstruction(uint64_t pc, EventType event, uint64_t count, 
                       int dest_reg = -1, bool is_branch = false) {
         generator.recordExecution(pc, event, count, dest_reg, is_branch);
-    }
-    
-    // Batch recording
-    void onInstructionBatch(uint64_t pc, const uint64_t* events, size_t event_count,
-                           int dest_reg = -1, bool is_branch = false) {
-        generator.recordExecutionMulti(pc, events, event_count, dest_reg, is_branch);
     }
     
     // Finalize and write output
