@@ -33,11 +33,12 @@ enum EventType {
 // Branch types detected at runtime
 enum class BranchType {
     NONE,
-    CONDITIONAL_BRANCH,
-    UNCONDITIONAL_BRANCH,
-    CALL,
-    RETURN,
-    TAIL_CALL
+    BRANCH,           // Conditional branch (beq, bne, etc.)
+    DIRECT_JUMP,      // Direct unconditional jump (j, jal with x0)
+    INDIRECT_JUMP,    // Indirect jump (jalr with x0)
+    CALL,             // Function call (jal, jalr with link)
+    RETURN,           // Function return
+    TAIL_CALL         // Tail call optimization
 };
 
 // Per-PC information from objdump
@@ -171,7 +172,8 @@ private:
         auto to_it = info.find(to_pc);
         
         if (from_it == info.end() || to_it == info.end()) {
-            return BranchType::UNCONDITIONAL_BRANCH;
+            // Default to direct jump for unknown
+            return BranchType::DIRECT_JUMP;
         }
         
         const std::string& from_func = from_it->second.func;
@@ -202,18 +204,42 @@ private:
             return BranchType::CALL;
         }
         
-        // Same function jump - determine if conditional or unconditional
+        // Same function jump - determine type
+        // Backward jumps are typically conditional branches (loops)
         if (to_pc < from_pc) {
-            // Backward jump - typically loop (conditional)
-            return BranchType::CONDITIONAL_BRANCH;
-        } else {
-            // Forward jump - check distance
-            uint64_t jump_distance = to_pc - from_pc;
-            if (jump_distance > 32) {
-                return BranchType::UNCONDITIONAL_BRANCH;
-            }
-            return BranchType::CONDITIONAL_BRANCH;
+            return BranchType::BRANCH;
         }
+        
+        // Forward jumps need more analysis
+        uint64_t jump_distance = to_pc - from_pc;
+        
+        // Small forward jumps are often conditional branches
+        if (jump_distance <= 32) {  // Typical if-else distance
+            return BranchType::BRANCH;
+        }
+        
+        // Large forward jumps are typically direct jumps (goto, break from loop)
+        // Without more info, assume direct jump
+        // Note: Simulator should provide hints for indirect jumps
+        return BranchType::DIRECT_JUMP;
+    }
+    
+    // Enhanced detection with branch type hint from simulator
+    BranchType detectBranchTypeWithHint(uint64_t from_pc, uint64_t to_pc, 
+                                        int dest_reg, bool is_sequential,
+                                        bool is_indirect) {
+        // Let simulator's hint override for indirect jumps
+        if (!is_sequential && is_indirect) {
+            // Check if it's an indirect call or jump
+            if (dest_reg > 0) {
+                return BranchType::CALL;  // Indirect call
+            } else {
+                return BranchType::INDIRECT_JUMP;  // Indirect jump
+            }
+        }
+        
+        // Fall back to regular detection
+        return detectBranchType(from_pc, to_pc, dest_reg, is_sequential);
     }
     
     // Handle detected branch/call
@@ -381,8 +407,9 @@ private:
                 break;
             }
             
-            case BranchType::CONDITIONAL_BRANCH:
-            case BranchType::UNCONDITIONAL_BRANCH: {
+            case BranchType::BRANCH:
+            case BranchType::DIRECT_JUMP:
+            case BranchType::INDIRECT_JUMP: {
                 if (collect_jumps) {
                     auto& branch_site = jumps[from_pc];
                     auto jump_it = std::find_if(branch_site.targets.begin(),
@@ -400,13 +427,22 @@ private:
                         branch_site.targets.push_back(new_jump);
                     }
                     
-                    // Update branch statistics
-                    if (type == BranchType::CONDITIONAL_BRANCH) {
+                    // Update branch statistics for conditional branches
+                    if (type == BranchType::BRANCH) {
                         info[from_pc].event[EVENT_BC]++;
                         // Simple misprediction model
                         if (jump_it != branch_site.targets.end() &&
                             jump_it->taken <= jump_it->executed / 2) {
                             info[from_pc].event[EVENT_BCM]++;
+                        }
+                    } else if (type == BranchType::INDIRECT_JUMP) {
+                        // Track indirect branch statistics
+                        info[from_pc].event[EVENT_BI]++;
+                        // Indirect branch misprediction (simplified)
+                        if (jump_it != branch_site.targets.end() &&
+                            branch_site.targets.size() > 1) {
+                            // Multiple targets = harder to predict
+                            info[from_pc].event[EVENT_BIM]++;
                         }
                     }
                 }
@@ -666,13 +702,15 @@ public:
                             target_fn = target_it->second.func;
                         }
                         
-                        // Determine jump type from recorded data
-                        bool is_conditional = (jump.taken < jump.executed);
+                        // For conditional branches, check if it was taken
+                        // Note: A branch site with multiple targets indicates taken/not-taken
+                        bool is_conditional = (jump_it->second.targets.size() > 1) || 
+                                            (jump.taken < jump.executed);
                         
                         if (is_conditional) {
-                            out << "jcnd=";
+                            out << "jcnd=";  // Conditional jump
                         } else {
-                            out << "jump=";
+                            out << "jump=";  // Unconditional jump
                         }
                         
                         if (dump_instr) {
