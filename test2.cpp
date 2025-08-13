@@ -51,18 +51,17 @@ struct PCInfo {
     }
 };
 
-// Call target information
-struct CallTarget {
-    uint64_t target_pc;
+// Generic target information for calls/jumps
+struct TargetInfo {
     uint64_t count;
-    uint64_t inclusive_events[MAX_EVENTS];
+    uint64_t inclusive_events[MAX_EVENTS];  // Only used for calls
     
-    CallTarget() : target_pc(0), count(0) {
+    TargetInfo() : count(0) {
         std::fill(std::begin(inclusive_events), std::end(inclusive_events), 0);
     }
 };
 
-// Branch information for conditional branches
+// Branch information for conditional branches (always exactly 2 targets)
 struct BranchInfo {
     uint64_t total_executed;     // Total times this branch executed
     uint64_t taken_target;        // Target when taken
@@ -72,19 +71,6 @@ struct BranchInfo {
     
     BranchInfo() : total_executed(0), taken_target(0), taken_count(0), 
                    fallthrough_target(0), fallthrough_count(0) {}
-};
-
-// Jump information for unconditional jumps
-struct JumpInfo {
-    uint64_t target_pc;
-    uint64_t count;
-    
-    JumpInfo() : target_pc(0), count(0) {}
-};
-
-// Call site information
-struct CallSite {
-    std::vector<CallTarget> targets;  // For indirect calls, can have multiple
 };
 
 // Call stack entry
@@ -102,10 +88,10 @@ private:
     // Main data
     std::unordered_map<uint64_t, PCInfo> info;
     
-    // Control flow tracking
-    std::unordered_map<uint64_t, CallSite> calls;      // Function calls
-    std::unordered_map<uint64_t, BranchInfo> branches; // Conditional branches
-    std::unordered_map<uint64_t, JumpInfo> jumps;      // Unconditional jumps
+    // Control flow tracking - unified structure
+    std::unordered_map<uint64_t, std::unordered_map<uint64_t, TargetInfo>> calls;  // from_pc -> (to_pc -> TargetInfo)
+    std::unordered_map<uint64_t, std::unordered_map<uint64_t, uint64_t>> jumps;    // from_pc -> (to_pc -> count)
+    std::unordered_map<uint64_t, BranchInfo> branches;                             // from_pc -> BranchInfo
     
     // Runtime state
     std::stack<CallStackEntry> call_stack;
@@ -332,14 +318,12 @@ private:
             case BranchType::DIRECT_JUMP:
             case BranchType::INDIRECT_JUMP: {
                 if (collect_jumps) {
-                    auto& jump = jumps[from_pc];
-                    jump.target_pc = to_pc;
-                    jump.count++;
+                    jumps[from_pc][to_pc]++;  // Simple and fast
                     
                     if (type == BranchType::INDIRECT_JUMP) {
                         info[from_pc].event[EVENT_BI]++;
-                        // Simplified indirect misprediction
-                        if (jump.count % 10 == 0) {
+                        // Misprediction for indirect jumps with multiple targets
+                        if (jumps[from_pc].size() > 1) {
                             info[from_pc].event[EVENT_BIM]++;
                         }
                     }
@@ -505,8 +489,8 @@ public:
             // Output calls
             auto call_it = calls.find(pc);
             if (call_it != calls.end()) {
-                for (const auto& target : call_it->second.targets) {
-                    auto callee_it = info.find(target.target_pc);
+                for (const auto& [target_pc, target_info] : call_it->second) {
+                    auto callee_it = info.find(target_pc);
                     if (callee_it != info.end()) {
                         out << "cfn=" << callee_it->second.func << "\n";
                         out << "cfl=" << callee_it->second.file << "\n";
@@ -514,9 +498,9 @@ public:
                         out << "cfn=unknown\n";
                     }
                     
-                    out << "calls=" << target.count << " ";
+                    out << "calls=" << target_info.count << " ";
                     if (dump_instr) {
-                        out << "0x" << std::hex << target.target_pc << std::dec;
+                        out << "0x" << std::hex << target_pc << std::dec;
                     }
                     out << " " << (callee_it != info.end() ? callee_it->second.line : 0) << "\n";
                     
@@ -526,7 +510,7 @@ public:
                     }
                     out << " " << pc_info.line;
                     for (size_t i = 0; i < num_events; ++i) {
-                        out << " " << target.inclusive_events[i];
+                        out << " " << target_info.inclusive_events[i];
                     }
                     out << "\n";
                 }
@@ -562,15 +546,17 @@ public:
                 // Output unconditional jumps
                 auto jump_it = jumps.find(pc);
                 if (jump_it != jumps.end()) {
-                    const auto& jump = jump_it->second;
-                    auto target_it = info.find(jump.target_pc);
-                    
-                    out << "jump=";
-                    if (dump_instr) {
-                        out << "0x" << std::hex << jump.target_pc << std::dec;
+                    // Output each target for this jump
+                    for (const auto& [target_pc, count] : jump_it->second) {
+                        auto target_it = info.find(target_pc);
+                        
+                        out << "jump=";
+                        if (dump_instr) {
+                            out << "0x" << std::hex << target_pc << std::dec;
+                        }
+                        out << "/" << (target_it != info.end() ? target_it->second.func : "unknown");
+                        out << " " << count << "\n";
                     }
-                    out << "/" << (target_it != info.end() ? target_it->second.func : "unknown");
-                    out << " " << jump.count << "\n";
                 }
             }
         }
