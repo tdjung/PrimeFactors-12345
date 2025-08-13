@@ -516,7 +516,7 @@ public:
                 }
             }
             
-            // Output branches
+            // Output branches (conditional branches only at source location)
             if (collect_jumps) {
                 auto branch_it = branches.find(pc);
                 if (branch_it != branches.end()) {
@@ -532,7 +532,7 @@ public:
                         out << " " << (target_it != info.end() ? target_it->second.line : 0) << "\n";
                     }
                     
-                    // Output fallthrough target
+                    // Output fallthrough target  
                     if (branch.fallthrough_count > 0) {
                         auto target_it = info.find(branch.fallthrough_target);
                         out << "jcnd=" << branch.fallthrough_count << "/" << branch.total_executed << " ";
@@ -543,7 +543,7 @@ public:
                     }
                 }
                 
-                // Output unconditional jumps
+                // Output unconditional jumps (only at source location)
                 auto jump_it = jumps.find(pc);
                 if (jump_it != jumps.end()) {
                     // Output each target for this jump
