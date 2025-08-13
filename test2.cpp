@@ -1,6 +1,6 @@
-// callgrind_generator_simple.hpp
-#ifndef CALLGRIND_GENERATOR_SIMPLE_HPP
-#define CALLGRIND_GENERATOR_SIMPLE_HPP
+// callgrind_generator_final.hpp
+#ifndef CALLGRIND_GENERATOR_FINAL_HPP
+#define CALLGRIND_GENERATOR_FINAL_HPP
 
 #include <iostream>
 #include <fstream>
@@ -51,23 +51,23 @@ struct PCInfo {
     }
 };
 
-// Generic target information for calls/jumps
-struct TargetInfo {
+// Target information for calls (includes inclusive costs)
+struct CallTargetInfo {
     uint64_t count;
-    uint64_t inclusive_events[MAX_EVENTS];  // Only used for calls
+    uint64_t inclusive_events[MAX_EVENTS];
     
-    TargetInfo() : count(0) {
+    CallTargetInfo() : count(0) {
         std::fill(std::begin(inclusive_events), std::end(inclusive_events), 0);
     }
 };
 
 // Branch information for conditional branches (always exactly 2 targets)
 struct BranchInfo {
-    uint64_t total_executed;     // Total times this branch executed
-    uint64_t taken_target;        // Target when taken
-    uint64_t taken_count;         // Times taken
-    uint64_t fallthrough_target;  // Target when not taken (next instruction)
-    uint64_t fallthrough_count;   // Times not taken
+    uint64_t total_executed;
+    uint64_t taken_target;
+    uint64_t taken_count;
+    uint64_t fallthrough_target;
+    uint64_t fallthrough_count;
     
     BranchInfo() : total_executed(0), taken_target(0), taken_count(0), 
                    fallthrough_target(0), fallthrough_count(0) {}
@@ -89,9 +89,9 @@ private:
     std::unordered_map<uint64_t, PCInfo> info;
     
     // Control flow tracking - unified structure
-    std::unordered_map<uint64_t, std::unordered_map<uint64_t, TargetInfo>> calls;  // from_pc -> (to_pc -> TargetInfo)
-    std::unordered_map<uint64_t, std::unordered_map<uint64_t, uint64_t>> jumps;    // from_pc -> (to_pc -> count)
-    std::unordered_map<uint64_t, BranchInfo> branches;                             // from_pc -> BranchInfo
+    std::unordered_map<uint64_t, std::unordered_map<uint64_t, CallTargetInfo>> calls;  // from_pc -> (to_pc -> CallTargetInfo)
+    std::unordered_map<uint64_t, std::unordered_map<uint64_t, uint64_t>> jumps;        // from_pc -> (to_pc -> count)
+    std::unordered_map<uint64_t, BranchInfo> branches;                                 // from_pc -> BranchInfo
     
     // Runtime state
     std::stack<CallStackEntry> call_stack;
@@ -128,7 +128,7 @@ private:
         
         if (from_it == info.end() || to_it == info.end()) {
             if (is_sequential) {
-                return BranchType::BRANCH;  // Assume conditional branch not taken
+                return BranchType::BRANCH;
             }
             return BranchType::DIRECT_JUMP;
         }
@@ -188,18 +188,7 @@ private:
                 call_stack.push(entry);
                 
                 // Record call
-                auto& call_site = calls[from_pc];
-                auto target_it = std::find_if(call_site.targets.begin(), call_site.targets.end(),
-                    [to_pc](const CallTarget& t) { return t.target_pc == to_pc; });
-                
-                if (target_it != call_site.targets.end()) {
-                    target_it->count++;
-                } else {
-                    CallTarget new_target;
-                    new_target.target_pc = to_pc;
-                    new_target.count = 1;
-                    call_site.targets.push_back(new_target);
-                }
+                calls[from_pc][to_pc].count++;
                 break;
             }
             
@@ -222,18 +211,7 @@ private:
                     call_stack.pop();
                     call_stack.push(tail_entry);
                     
-                    auto& call_site = calls[from_pc];
-                    auto target_it = std::find_if(call_site.targets.begin(), call_site.targets.end(),
-                        [to_pc](const CallTarget& t) { return t.target_pc == to_pc; });
-                    
-                    if (target_it != call_site.targets.end()) {
-                        target_it->count++;
-                    } else {
-                        CallTarget new_target;
-                        new_target.target_pc = to_pc;
-                        new_target.count = 1;
-                        call_site.targets.push_back(new_target);
-                    }
+                    calls[from_pc][to_pc].count++;
                 }
                 break;
             }
@@ -248,35 +226,19 @@ private:
                         inclusive_cost[i] = accumulated_events[i] - entry.events_at_entry[i];
                     }
                     
-                    // Update call record
-                    auto call_it = calls.find(entry.caller_pc);
-                    if (call_it != calls.end()) {
-                        auto target_it = std::find_if(call_it->second.targets.begin(),
-                                                      call_it->second.targets.end(),
-                            [&entry](const CallTarget& t) { return t.target_pc == entry.callee_pc; });
-                        
-                        if (target_it != call_it->second.targets.end()) {
-                            for (size_t i = 0; i < MAX_EVENTS; ++i) {
-                                target_it->inclusive_events[i] += inclusive_cost[i];
-                            }
-                        }
+                    // Update call record directly
+                    auto& call_info = calls[entry.caller_pc][entry.callee_pc];
+                    for (size_t i = 0; i < MAX_EVENTS; ++i) {
+                        call_info.inclusive_events[i] += inclusive_cost[i];
                     }
                     
                     // Handle tail call chain
                     if (entry.is_tail_call && !tail_call_chain.empty()) {
                         for (const auto& [tail_from, tail_to] : tail_call_chain) {
-                            auto tail_call_it = calls.find(tail_from);
-                            if (tail_call_it != calls.end()) {
-                                auto target_it = std::find_if(tail_call_it->second.targets.begin(),
-                                                             tail_call_it->second.targets.end(),
-                                    [tail_to](const CallTarget& t) { return t.target_pc == tail_to; });
-                                
-                                if (target_it != tail_call_it->second.targets.end()) {
-                                    for (size_t i = 0; i < MAX_EVENTS; ++i) {
-                                        target_it->inclusive_events[i] += 
-                                            inclusive_cost[i] / (tail_call_chain.size() + 1);
-                                    }
-                                }
+                            auto& tail_info = calls[tail_from][tail_to];
+                            for (size_t i = 0; i < MAX_EVENTS; ++i) {
+                                tail_info.inclusive_events[i] += 
+                                    inclusive_cost[i] / (tail_call_chain.size() + 1);
                             }
                         }
                         tail_call_chain.clear();
@@ -318,7 +280,7 @@ private:
             case BranchType::DIRECT_JUMP:
             case BranchType::INDIRECT_JUMP: {
                 if (collect_jumps) {
-                    jumps[from_pc][to_pc]++;  // Simple and fast
+                    jumps[from_pc][to_pc]++;
                     
                     if (type == BranchType::INDIRECT_JUMP) {
                         info[from_pc].event[EVENT_BI]++;
@@ -489,7 +451,7 @@ public:
             // Output calls
             auto call_it = calls.find(pc);
             if (call_it != calls.end()) {
-                for (const auto& [target_pc, target_info] : call_it->second) {
+                for (const auto& [target_pc, call_info] : call_it->second) {
                     auto callee_it = info.find(target_pc);
                     if (callee_it != info.end()) {
                         out << "cfn=" << callee_it->second.func << "\n";
@@ -498,7 +460,7 @@ public:
                         out << "cfn=unknown\n";
                     }
                     
-                    out << "calls=" << target_info.count << " ";
+                    out << "calls=" << call_info.count << " ";
                     if (dump_instr) {
                         out << "0x" << std::hex << target_pc << std::dec;
                     }
@@ -510,13 +472,13 @@ public:
                     }
                     out << " " << pc_info.line;
                     for (size_t i = 0; i < num_events; ++i) {
-                        out << " " << target_info.inclusive_events[i];
+                        out << " " << call_info.inclusive_events[i];
                     }
                     out << "\n";
                 }
             }
             
-            // Output branches (conditional branches only at source location)
+            // Output branches (only at source location)
             if (collect_jumps) {
                 auto branch_it = branches.find(pc);
                 if (branch_it != branches.end()) {
@@ -532,7 +494,7 @@ public:
                         out << " " << (target_it != info.end() ? target_it->second.line : 0) << "\n";
                     }
                     
-                    // Output fallthrough target  
+                    // Output fallthrough target
                     if (branch.fallthrough_count > 0) {
                         auto target_it = info.find(branch.fallthrough_target);
                         out << "jcnd=" << branch.fallthrough_count << "/" << branch.total_executed << " ";
@@ -608,4 +570,4 @@ public:
     }
 };
 
-#endif // CALLGRIND_GENERATOR_SIMPLE_HPP
+#endif // CALLGRIND_GENERATOR_FINAL_HPP
