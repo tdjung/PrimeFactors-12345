@@ -12,6 +12,7 @@
 #include <stack>
 #include <cstdint>
 #include <unistd.h>
+#include <string_view>
 
 // Maximum number of events to track
 constexpr size_t MAX_EVENTS = 10;
@@ -37,6 +38,13 @@ enum class BranchType {
     TAIL_CALL         // Tail call
 };
 
+// Function type for optimization
+enum class FunctionType {
+    NORMAL,
+    SAVE_HELPER,
+    RESTORE_HELPER
+};
+
 // Per-PC information from objdump
 struct PCInfo {
     uint64_t pc;
@@ -45,8 +53,9 @@ struct PCInfo {
     std::string file;
     uint32_t line;
     uint64_t event[MAX_EVENTS];
+    FunctionType func_type;  // Cache function type
     
-    PCInfo() : pc(0), line(0) {
+    PCInfo() : pc(0), line(0), func_type(FunctionType::NORMAL) {
         std::fill(std::begin(event), std::end(event), 0);
     }
 };
@@ -95,12 +104,15 @@ private:
     
     // Runtime state
     std::stack<CallStackEntry> call_stack;
-    std::vector<std::pair<uint64_t, uint64_t>> tail_call_chain;
     uint64_t last_pc;
     int last_dest_reg;
     bool last_was_branch;
     uint32_t last_inst_size;
     uint64_t accumulated_events[MAX_EVENTS];
+    
+    // Track the real caller when in compiler helper functions
+    uint64_t real_caller_pc;
+    std::string real_caller_func;
     
     // Configuration
     std::string output_filename;
@@ -112,13 +124,40 @@ private:
     std::vector<std::string> event_names;
     size_t num_events;
     
-    // Detect instruction size
-    uint32_t detectInstructionSize(const std::string& assembly) {
-        if (assembly.find("c.") != std::string::npos || 
-            assembly.find("\tc.") != std::string::npos) {
-            return 2;  // RISC-V compressed
+    // Constants for helper function detection
+    static constexpr std::string_view SAVE_PREFIX = "__riscv_save";
+    static constexpr std::string_view RESTORE_PREFIX = "__riscv_restore";
+    
+    // Determine function type from name (called once when loading)
+    inline static FunctionType determineFunctionType(const std::string& func_name) {
+        std::string_view sv(func_name);
+        if (sv.substr(0, SAVE_PREFIX.size()) == SAVE_PREFIX) {
+            return FunctionType::SAVE_HELPER;
         }
-        return 4;
+        if (sv.substr(0, RESTORE_PREFIX.size()) == RESTORE_PREFIX) {
+            return FunctionType::RESTORE_HELPER;
+        }
+        return FunctionType::NORMAL;
+    }
+    
+    // Fast inline checks using cached type
+    inline bool isSaveHelper(FunctionType type) const {
+        return type == FunctionType::SAVE_HELPER;
+    }
+    
+    inline bool isRestoreHelper(FunctionType type) const {
+        return type == FunctionType::RESTORE_HELPER;
+    }
+    
+    inline bool isCompilerHelper(FunctionType type) const {
+        return type != FunctionType::NORMAL;
+    }
+    
+    // Detect instruction size
+    inline uint32_t detectInstructionSize(const std::string& assembly) const {
+        // RISC-V compressed instructions start with 'c.'
+        return (assembly.find("c.") != std::string::npos || 
+                assembly.find("\tc.") != std::string::npos) ? 2 : 4;
     }
     
     // Detect branch type
@@ -127,30 +166,48 @@ private:
         auto to_it = info.find(to_pc);
         
         if (from_it == info.end() || to_it == info.end()) {
-            if (is_sequential) {
-                return BranchType::BRANCH;
-            }
-            return BranchType::DIRECT_JUMP;
+            return is_sequential ? BranchType::BRANCH : BranchType::DIRECT_JUMP;
         }
         
-        const std::string& from_func = from_it->second.func;
-        const std::string& to_func = to_it->second.func;
+        const auto& from_info = from_it->second;
+        const auto& to_info = to_it->second;
+        const FunctionType from_type = from_info.func_type;
+        const FunctionType to_type = to_info.func_type;
+        
+        // Special handling for compiler helpers
+        if (isCompilerHelper(from_type)) {
+            // Return from restore helper to normal function
+            if (isRestoreHelper(from_type) && !isCompilerHelper(to_type)) {
+                return BranchType::RETURN;
+            }
+            // Fall-through between restore helpers
+            if (isRestoreHelper(from_type) && isRestoreHelper(to_type) && is_sequential) {
+                return BranchType::NONE;  // Internal flow
+            }
+        }
+        
+        // Check for calls to compiler helpers
+        if (!is_sequential && isCompilerHelper(to_type)) {
+            if (isSaveHelper(to_type)) {
+                return BranchType::CALL;
+            }
+            if (isRestoreHelper(to_type)) {
+                return BranchType::TAIL_CALL;
+            }
+        }
         
         // Check for return
         if (!is_sequential && !call_stack.empty()) {
             const auto& stack_top = call_stack.top();
             auto caller_it = info.find(stack_top.caller_pc);
-            if (caller_it != info.end() && to_func == caller_it->second.func) {
+            if (caller_it != info.end() && to_info.func == caller_it->second.func) {
                 return BranchType::RETURN;
             }
         }
         
         // Different function = call or tail call
-        if (!is_sequential && from_func != to_func) {
-            if (dest_reg == 0) {
-                return BranchType::TAIL_CALL;
-            }
-            return BranchType::CALL;
+        if (!is_sequential && from_info.func != to_info.func) {
+            return (dest_reg == 0) ? BranchType::TAIL_CALL : BranchType::CALL;
         }
         
         // Same function
@@ -158,60 +215,82 @@ private:
             return BranchType::BRANCH;  // Not taken
         }
         
-        // Backward jump = likely loop (conditional)
+        // Backward jump = likely loop
         if (to_pc < from_pc) {
             return BranchType::BRANCH;
         }
         
-        // Forward jump
-        uint64_t jump_distance = to_pc - from_pc;
-        if (jump_distance <= 32) {
-            return BranchType::BRANCH;
-        }
-        
-        return BranchType::DIRECT_JUMP;
+        // Forward jump - small distance = likely branch
+        return ((to_pc - from_pc) <= 32) ? BranchType::BRANCH : BranchType::DIRECT_JUMP;
     }
     
     // Handle branch/call
     void handleBranch(uint64_t from_pc, uint64_t to_pc, BranchType type, bool is_sequential) {
+        // Skip internal flow within compiler helpers
+        if (type == BranchType::NONE) {
+            return;
+        }
+        
+        auto from_it = info.find(from_pc);
+        auto to_it = info.find(to_pc);
+        
+        std::string from_func = (from_it != info.end()) ? from_it->second.func : "unknown";
+        std::string to_func = (to_it != info.end()) ? to_it->second.func : "unknown";
+        FunctionType to_type = (to_it != info.end()) ? to_it->second.func_type : FunctionType::NORMAL;
+        FunctionType from_type = (from_it != info.end()) ? from_it->second.func_type : FunctionType::NORMAL;
+        
         switch (type) {
             case BranchType::CALL: {
+                // Special handling for calls to save helpers
+                if (isCompilerHelper(to_type)) {
+                    // Remember the real caller for later
+                    real_caller_pc = from_pc;
+                    real_caller_func = std::move(from_func);
+                    return;  // Don't record helper calls
+                }
+                
+                // Check if calling from within a save helper
+                if (isCompilerHelper(from_type) && !real_caller_func.empty()) {
+                    // Use the real caller instead
+                    from_pc = real_caller_pc;
+                    from_func = std::move(real_caller_func);
+                    real_caller_pc = 0;
+                    real_caller_func.clear();
+                }
+                
                 // Push to call stack
                 CallStackEntry entry;
                 entry.caller_pc = from_pc;
                 entry.callee_pc = to_pc;
-                entry.caller_func = info[from_pc].func;
-                entry.callee_func = info[to_pc].func;
+                entry.caller_func = std::move(from_func);
+                entry.callee_func = std::move(to_func);
                 entry.is_tail_call = false;
-                std::copy(std::begin(accumulated_events), std::end(accumulated_events), 
-                         std::begin(entry.events_at_entry));
-                call_stack.push(entry);
+                std::copy(accumulated_events, accumulated_events + MAX_EVENTS, entry.events_at_entry);
+                call_stack.push(std::move(entry));
                 
                 // Record call
-                calls[from_pc][to_pc].count++;
+                ++calls[from_pc][to_pc].count;
                 break;
             }
             
             case BranchType::TAIL_CALL: {
-                tail_call_chain.push_back({from_pc, to_pc});
+                // Skip tail calls to restore helpers
+                if (isCompilerHelper(to_type)) {
+                    return;
+                }
+                
+                // Record call
+                ++calls[from_pc][to_pc].count;
                 
                 if (!call_stack.empty()) {
-                    auto& original_entry = call_stack.top();
-                    
                     CallStackEntry tail_entry;
-                    tail_entry.caller_pc = original_entry.caller_pc;
+                    tail_entry.caller_pc = from_pc;
                     tail_entry.callee_pc = to_pc;
-                    tail_entry.caller_func = original_entry.caller_func;
-                    tail_entry.callee_func = info[to_pc].func;
+                    tail_entry.caller_func = std::move(from_func);
+                    tail_entry.callee_func = std::move(to_func);
                     tail_entry.is_tail_call = true;
-                    std::copy(std::begin(original_entry.events_at_entry),
-                             std::end(original_entry.events_at_entry),
-                             std::begin(tail_entry.events_at_entry));
-                    
-                    call_stack.pop();
-                    call_stack.push(tail_entry);
-                    
-                    calls[from_pc][to_pc].count++;
+                    std::copy(accumulated_events, accumulated_events + MAX_EVENTS, tail_entry.events_at_entry);
+                    call_stack.push(std::move(tail_entry));
                 }
                 break;
             }
@@ -219,32 +298,28 @@ private:
             case BranchType::RETURN: {
                 if (!call_stack.empty()) {
                     auto& entry = call_stack.top();
-                    
-                    // Calculate inclusive cost
-                    uint64_t inclusive_cost[MAX_EVENTS];
-                    for (size_t i = 0; i < MAX_EVENTS; ++i) {
-                        inclusive_cost[i] = accumulated_events[i] - entry.events_at_entry[i];
-                    }
-                    
-                    // Update call record directly
                     auto& call_info = calls[entry.caller_pc][entry.callee_pc];
+                    
+                    // Update inclusive costs directly
                     for (size_t i = 0; i < MAX_EVENTS; ++i) {
-                        call_info.inclusive_events[i] += inclusive_cost[i];
+                        call_info.inclusive_events[i] += accumulated_events[i] - entry.events_at_entry[i];
                     }
+                    
+                    bool was_tail_call = entry.is_tail_call;
+                    call_stack.pop();
                     
                     // Handle tail call chain
-                    if (entry.is_tail_call && !tail_call_chain.empty()) {
-                        for (const auto& [tail_from, tail_to] : tail_call_chain) {
-                            auto& tail_info = calls[tail_from][tail_to];
-                            for (size_t i = 0; i < MAX_EVENTS; ++i) {
-                                tail_info.inclusive_events[i] += 
-                                    inclusive_cost[i] / (tail_call_chain.size() + 1);
-                            }
+                    if (was_tail_call && !call_stack.empty()) {
+                        auto& original_entry = call_stack.top();
+                        auto& original_call = calls[original_entry.caller_pc][original_entry.callee_pc];
+                        
+                        // Update original call's inclusive costs directly
+                        for (size_t i = 0; i < MAX_EVENTS; ++i) {
+                            original_call.inclusive_events[i] += accumulated_events[i] - original_entry.events_at_entry[i];
                         }
-                        tail_call_chain.clear();
+                        
+                        call_stack.pop();
                     }
-                    
-                    call_stack.pop();
                 }
                 break;
             }
@@ -252,25 +327,25 @@ private:
             case BranchType::BRANCH: {
                 if (collect_jumps) {
                     auto& branch = branches[from_pc];
-                    branch.total_executed++;
+                    ++branch.total_executed;
                     
                     if (is_sequential) {
-                        // Not taken - fallthrough
                         branch.fallthrough_target = to_pc;
-                        branch.fallthrough_count++;
+                        ++branch.fallthrough_count;
                     } else {
-                        // Taken
                         branch.taken_target = to_pc;
-                        branch.taken_count++;
+                        ++branch.taken_count;
                     }
                     
-                    // Update statistics
-                    info[from_pc].event[EVENT_BC]++;
-                    // Simple misprediction model
+                    // Update branch statistics
+                    ++info[from_pc].event[EVENT_BC];
+                    
+                    // Simple misprediction model - minority path
                     if (branch.taken_count > 0 && branch.fallthrough_count > 0) {
                         uint64_t minority = std::min(branch.taken_count, branch.fallthrough_count);
-                        if (minority == branch.taken_count || minority == branch.fallthrough_count) {
-                            info[from_pc].event[EVENT_BCM]++;
+                        if (branch.total_executed > 1 && 
+                            (minority == branch.taken_count || minority == branch.fallthrough_count)) {
+                            ++info[from_pc].event[EVENT_BCM];
                         }
                     }
                 }
@@ -280,13 +355,13 @@ private:
             case BranchType::DIRECT_JUMP:
             case BranchType::INDIRECT_JUMP: {
                 if (collect_jumps) {
-                    jumps[from_pc][to_pc]++;
+                    ++jumps[from_pc][to_pc];
                     
                     if (type == BranchType::INDIRECT_JUMP) {
-                        info[from_pc].event[EVENT_BI]++;
+                        ++info[from_pc].event[EVENT_BI];
                         // Misprediction for indirect jumps with multiple targets
                         if (jumps[from_pc].size() > 1) {
-                            info[from_pc].event[EVENT_BIM]++;
+                            ++info[from_pc].event[EVENT_BIM];
                         }
                     }
                 }
@@ -308,10 +383,11 @@ public:
           dump_instr(true),
           branch_sim(true),
           collect_jumps(true),
-          num_events(2) {
+          num_events(2),
+          real_caller_pc(0) {
         
         event_names = {"Ir", "Cycle", "Bc", "Bcm", "Bi", "Bim"};
-        std::fill(std::begin(accumulated_events), std::end(accumulated_events), 0);
+        std::fill(accumulated_events, accumulated_events + MAX_EVENTS, 0);
     }
     
     void setOptions(bool dump_instr_opt, bool branch_sim_opt, bool collect_jumps_opt) {
@@ -335,6 +411,7 @@ public:
         pc_info.assembly = assembly;
         pc_info.file = file;
         pc_info.line = line;
+        pc_info.func_type = determineFunctionType(func);  // Cache function type
     }
     
     // Record instruction execution
@@ -347,9 +424,11 @@ public:
             pc_info.func = "unknown";
             pc_info.file = "unknown";
             pc_info.line = 0;
+            pc_info.func_type = FunctionType::NORMAL;
+            it = info.find(pc);  // Update iterator
         }
         
-        // Update events
+        // Update events for ALL functions including helpers
         info[pc].event[event_type] += count;
         accumulated_events[event_type] += count;
         
@@ -364,12 +443,7 @@ public:
         last_pc = pc;
         last_dest_reg = dest_reg;
         last_was_branch = is_branch_instruction;
-        
-        if (it != info.end() && !it->second.assembly.empty()) {
-            last_inst_size = detectInstructionSize(it->second.assembly);
-        } else {
-            last_inst_size = 4;
-        }
+        last_inst_size = it->second.assembly.empty() ? 4 : detectInstructionSize(it->second.assembly);
     }
     
     // Write output
@@ -381,25 +455,26 @@ public:
         }
         
         // Header
-        out << "# callgrind format\n";
-        out << "version: 1\n";
-        out << "creator: core-simulator\n";
-        out << "pid: " << getpid() << "\n";
-        out << "cmd: simulated_program\n";
-        out << "part: 1\n\n";
+        out << "# callgrind format\n"
+            << "version: 1\n"
+            << "creator: core-simulator\n"
+            << "pid: " << getpid() << "\n"
+            << "cmd: simulated_program\n"
+            << "part: 1\n\n"
+            << "positions:";
         
-        out << "positions:";
         if (dump_instr) out << " instr";
-        out << " line\n";
+        out << " line\n"
+            << "events:";
         
-        out << "events:";
         for (size_t i = 0; i < num_events && i < event_names.size(); ++i) {
             out << " " << event_names[i];
         }
         out << "\n\n";
         
-        // Sort PCs
+        // Sort PCs - include ALL PCs
         std::vector<uint64_t> sorted_pcs;
+        sorted_pcs.reserve(info.size());
         for (const auto& [pc, _] : info) {
             sorted_pcs.push_back(pc);
         }
@@ -448,14 +523,18 @@ public:
             }
             out << "\n";
             
-            // Output calls
+            // Output calls (but skip calls to/from compiler helpers)
             auto call_it = calls.find(pc);
             if (call_it != calls.end()) {
                 for (const auto& [target_pc, call_info] : call_it->second) {
                     auto callee_it = info.find(target_pc);
                     if (callee_it != info.end()) {
-                        out << "cfn=" << callee_it->second.func << "\n";
-                        out << "cfl=" << callee_it->second.file << "\n";
+                        // Skip calls to compiler helpers
+                        if (isCompilerHelper(callee_it->second.func_type)) {
+                            continue;
+                        }
+                        out << "cfn=" << callee_it->second.func << "\n"
+                            << "cfl=" << callee_it->second.file << "\n";
                     } else {
                         out << "cfn=unknown\n";
                     }
@@ -478,7 +557,7 @@ public:
                 }
             }
             
-            // Output branches (only at source location)
+            // Output branches
             if (collect_jumps) {
                 auto branch_it = branches.find(pc);
                 if (branch_it != branches.end()) {
@@ -505,27 +584,25 @@ public:
                     }
                 }
                 
-                // Output unconditional jumps (only at source location)
+                // Output unconditional jumps
                 auto jump_it = jumps.find(pc);
                 if (jump_it != jumps.end()) {
-                    // Output each target for this jump
                     for (const auto& [target_pc, count] : jump_it->second) {
                         auto target_it = info.find(target_pc);
-                        
                         out << "jump=";
                         if (dump_instr) {
                             out << "0x" << std::hex << target_pc << std::dec;
                         }
-                        out << "/" << (target_it != info.end() ? target_it->second.func : "unknown");
-                        out << " " << count << "\n";
+                        out << "/" << (target_it != info.end() ? target_it->second.func : "unknown")
+                            << " " << count << "\n";
                     }
                 }
             }
         }
         
         // Summary
-        out << "\n# Summary\n";
-        out << "totals:";
+        out << "\n# Summary\n"
+            << "totals:";
         uint64_t totals[MAX_EVENTS] = {0};
         for (const auto& [_, pc_info] : info) {
             for (size_t i = 0; i < num_events; ++i) {
