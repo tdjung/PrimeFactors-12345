@@ -251,25 +251,28 @@ private:
         
         switch (type) {
             case BranchType::CALL: {
+                // Keep a copy of original values
+                uint64_t original_from_pc = from_pc;
+                std::string original_from_func = from_func;
+                bool used_real_caller = false;
+                
                 // Skip calls FROM compiler helpers (but not TO helpers)
                 if (isCompilerHelper(from_type)) {
-                    // If calling from save helper, remember the real caller
+                    // If calling from save helper, use the real caller
                     if (isSaveHelper(from_type) && !real_caller_func.empty()) {
-                        // Use the real caller for this call
                         from_pc = real_caller_pc;
-                        from_func = std::move(real_caller_func);
-                        real_caller_pc = 0;
-                        real_caller_func.clear();
+                        from_func = real_caller_func;
+                        used_real_caller = true;
                     } else {
                         // Calls from restore helpers are ignored
                         return;
                     }
                 }
                 
-                // Remember real caller if calling a save helper
-                if (isSaveHelper(to_type)) {
-                    real_caller_pc = from_pc;
-                    real_caller_func = from_func;
+                // Remember real caller if calling a save helper (use original values)
+                if (isSaveHelper(to_type) && !used_real_caller) {
+                    real_caller_pc = original_from_pc;
+                    real_caller_func = original_from_func;
                     // But still record the call to the helper!
                 }
                 
@@ -277,15 +280,21 @@ private:
                 CallStackEntry entry;
                 entry.caller_pc = from_pc;
                 entry.callee_pc = to_pc;
-                entry.caller_func = std::move(from_func);
-                entry.callee_func = std::move(to_func);
+                entry.caller_func = from_func;
+                entry.callee_func = to_func;
                 entry.is_tail_call = false;
                 entry.is_fall_through = false;
                 std::copy(accumulated_events, accumulated_events + MAX_EVENTS, entry.events_at_entry);
-                call_stack.push(std::move(entry));
+                call_stack.push(entry);
                 
                 // Record call
                 ++calls[from_pc][to_pc].count;
+                
+                // Clear real_caller if we used it
+                if (used_real_caller) {
+                    real_caller_pc = 0;
+                    real_caller_func.clear();
+                }
                 break;
             }
             
@@ -302,12 +311,12 @@ private:
                     CallStackEntry tail_entry;
                     tail_entry.caller_pc = from_pc;
                     tail_entry.callee_pc = to_pc;
-                    tail_entry.caller_func = std::move(from_func);
-                    tail_entry.callee_func = std::move(to_func);
+                    tail_entry.caller_func = from_func;
+                    tail_entry.callee_func = to_func;
                     tail_entry.is_tail_call = true;
                     tail_entry.is_fall_through = false;
                     std::copy(accumulated_events, accumulated_events + MAX_EVENTS, tail_entry.events_at_entry);
-                    call_stack.push(std::move(tail_entry));
+                    call_stack.push(tail_entry);
                 }
                 break;
             }
@@ -322,12 +331,12 @@ private:
                 CallStackEntry entry;
                 entry.caller_pc = from_pc;
                 entry.callee_pc = to_pc;
-                entry.caller_func = std::move(from_func);
-                entry.callee_func = std::move(to_func);
+                entry.caller_func = from_func;
+                entry.callee_func = to_func;
                 entry.is_tail_call = false;
                 entry.is_fall_through = true;
                 std::copy(accumulated_events, accumulated_events + MAX_EVENTS, entry.events_at_entry);
-                call_stack.push(std::move(entry));
+                call_stack.push(entry);
                 break;
             }
             
