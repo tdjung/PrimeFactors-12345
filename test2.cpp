@@ -241,21 +241,27 @@ private:
         
         switch (type) {
             case BranchType::CALL: {
+                // Skip calls from any compiler helper
+                if (isCompilerHelper(from_type)) {
+                    // If calling from save helper, remember the real caller
+                    if (isSaveHelper(from_type) && !real_caller_func.empty()) {
+                        // Use the real caller for this call
+                        from_pc = real_caller_pc;
+                        from_func = std::move(real_caller_func);
+                        real_caller_pc = 0;
+                        real_caller_func.clear();
+                    } else {
+                        // Calls from restore helpers are ignored
+                        return;
+                    }
+                }
+                
                 // Special handling for calls to save helpers
                 if (isCompilerHelper(to_type)) {
                     // Remember the real caller for later
                     real_caller_pc = from_pc;
-                    real_caller_func = std::move(from_func);
+                    real_caller_func = from_func;
                     return;  // Don't record helper calls
-                }
-                
-                // Check if calling from within a save helper
-                if (isCompilerHelper(from_type) && !real_caller_func.empty()) {
-                    // Use the real caller instead
-                    from_pc = real_caller_pc;
-                    from_func = std::move(real_caller_func);
-                    real_caller_pc = 0;
-                    real_caller_func.clear();
                 }
                 
                 // Push to call stack
@@ -276,6 +282,11 @@ private:
             case BranchType::TAIL_CALL: {
                 // Skip tail calls to restore helpers
                 if (isCompilerHelper(to_type)) {
+                    return;
+                }
+                
+                // Skip tail calls FROM restore helpers
+                if (isCompilerHelper(from_type)) {
                     return;
                 }
                 
@@ -354,6 +365,11 @@ private:
             
             case BranchType::DIRECT_JUMP:
             case BranchType::INDIRECT_JUMP: {
+                // Skip jumps from compiler helpers
+                if (isCompilerHelper(from_type)) {
+                    return;
+                }
+                
                 if (collect_jumps) {
                     ++jumps[from_pc][to_pc];
                     
