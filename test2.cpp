@@ -109,6 +109,7 @@ private:
     bool last_was_branch;
     uint32_t last_inst_size;
     uint64_t accumulated_events[MAX_EVENTS];
+    std::string last_func_name;  // Track last function name for fall-through detection
     
     // Track the real caller when in compiler helper functions
     uint64_t real_caller_pc;
@@ -186,6 +187,13 @@ private:
             }
         }
         
+        // Check for function fall-through (sequential execution across function boundary)
+        if (is_sequential && from_info.func != to_info.func && !isCompilerHelper(from_type)) {
+            // This is a fall-through from one function to another
+            // We want to treat this as internal flow, not a call
+            return BranchType::NONE;
+        }
+        
         // Check for calls to compiler helpers
         if (!is_sequential && isCompilerHelper(to_type)) {
             if (isSaveHelper(to_type)) {
@@ -205,7 +213,7 @@ private:
             }
         }
         
-        // Different function = call or tail call
+        // Different function = call or tail call (but only for non-sequential)
         if (!is_sequential && from_info.func != to_info.func) {
             return (dest_reg == 0) ? BranchType::TAIL_CALL : BranchType::CALL;
         }
@@ -400,7 +408,8 @@ public:
           branch_sim(true),
           collect_jumps(true),
           num_events(2),
-          real_caller_pc(0) {
+          real_caller_pc(0),
+          last_func_name("") {
         
         event_names = {"Ir", "Cycle", "Bc", "Bcm", "Bi", "Bim"};
         std::fill(accumulated_events, accumulated_events + MAX_EVENTS, 0);
@@ -444,15 +453,23 @@ public:
             it = info.find(pc);  // Update iterator
         }
         
+        // Get current function name
+        std::string current_func = it->second.func;
+        
         // Update events for ALL functions including helpers
         info[pc].event[event_type] += count;
         accumulated_events[event_type] += count;
         
-        // Handle previous branch
-        if (last_pc != 0 && last_was_branch) {
-            bool is_sequential = (pc == last_pc + last_inst_size);
-            BranchType branch_type = detectBranchType(last_pc, pc, last_dest_reg, is_sequential);
-            handleBranch(last_pc, pc, branch_type, is_sequential);
+        // Handle previous branch or function boundary crossing
+        if (last_pc != 0) {
+            bool function_changed = (!last_func_name.empty() && current_func != last_func_name);
+            
+            // Process if it was a branch OR function changed (fall-through detection)
+            if (last_was_branch || function_changed) {
+                bool is_sequential = (pc == last_pc + last_inst_size);
+                BranchType branch_type = detectBranchType(last_pc, pc, last_dest_reg, is_sequential);
+                handleBranch(last_pc, pc, branch_type, is_sequential);
+            }
         }
         
         // Update state
@@ -460,6 +477,7 @@ public:
         last_dest_reg = dest_reg;
         last_was_branch = is_branch_instruction;
         last_inst_size = it->second.assembly.empty() ? 4 : detectInstructionSize(it->second.assembly);
+        last_func_name = current_func;
     }
     
     // Write output
