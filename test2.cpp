@@ -35,7 +35,8 @@ enum class BranchType {
     INDIRECT_JUMP,    // Indirect jump
     CALL,             // Function call
     RETURN,           // Function return
-    TAIL_CALL         // Tail call
+    TAIL_CALL,        // Tail call
+    FALL_THROUGH      // Fall-through to next function
 };
 
 // Function type for optimization
@@ -64,8 +65,9 @@ struct PCInfo {
 struct CallTargetInfo {
     uint64_t count;
     uint64_t inclusive_events[MAX_EVENTS];
+    bool is_fall_through;  // Track if this is a fall-through
     
-    CallTargetInfo() : count(0) {
+    CallTargetInfo() : count(0), is_fall_through(false) {
         std::fill(std::begin(inclusive_events), std::end(inclusive_events), 0);
     }
 };
@@ -90,6 +92,7 @@ struct CallStackEntry {
     std::string callee_func;
     uint64_t events_at_entry[MAX_EVENTS];
     bool is_tail_call;
+    bool is_fall_through;  // Track if this was a fall-through entry
 };
 
 class CallgrindGenerator {
@@ -181,17 +184,16 @@ private:
             if (isRestoreHelper(from_type) && !isCompilerHelper(to_type)) {
                 return BranchType::RETURN;
             }
-            // Fall-through between restore helpers
+            // Fall-through between restore helpers (e.g., restore_4 -> restore_0)
             if (isRestoreHelper(from_type) && isRestoreHelper(to_type) && is_sequential) {
-                return BranchType::NONE;  // Internal flow
+                return BranchType::NONE;  // Internal flow within helpers
             }
         }
         
         // Check for function fall-through (sequential execution across function boundary)
         if (is_sequential && from_info.func != to_info.func && !isCompilerHelper(from_type)) {
             // This is a fall-through from one function to another
-            // We want to treat this as internal flow, not a call
-            return BranchType::NONE;
+            return BranchType::FALL_THROUGH;
         }
         
         // Check for calls to compiler helpers
@@ -249,7 +251,7 @@ private:
         
         switch (type) {
             case BranchType::CALL: {
-                // Skip calls from any compiler helper
+                // Skip calls FROM compiler helpers (but not TO helpers)
                 if (isCompilerHelper(from_type)) {
                     // If calling from save helper, remember the real caller
                     if (isSaveHelper(from_type) && !real_caller_func.empty()) {
@@ -264,12 +266,11 @@ private:
                     }
                 }
                 
-                // Special handling for calls to save helpers
-                if (isCompilerHelper(to_type)) {
-                    // Remember the real caller for later
+                // Remember real caller if calling a save helper
+                if (isSaveHelper(to_type)) {
                     real_caller_pc = from_pc;
                     real_caller_func = from_func;
-                    return;  // Don't record helper calls
+                    // But still record the call to the helper!
                 }
                 
                 // Push to call stack
@@ -279,6 +280,7 @@ private:
                 entry.caller_func = std::move(from_func);
                 entry.callee_func = std::move(to_func);
                 entry.is_tail_call = false;
+                entry.is_fall_through = false;
                 std::copy(accumulated_events, accumulated_events + MAX_EVENTS, entry.events_at_entry);
                 call_stack.push(std::move(entry));
                 
@@ -288,17 +290,12 @@ private:
             }
             
             case BranchType::TAIL_CALL: {
-                // Skip tail calls to restore helpers
-                if (isCompilerHelper(to_type)) {
-                    return;
-                }
-                
                 // Skip tail calls FROM restore helpers
                 if (isCompilerHelper(from_type)) {
                     return;
                 }
                 
-                // Record call
+                // Record tail call (including to restore helpers)
                 ++calls[from_pc][to_pc].count;
                 
                 if (!call_stack.empty()) {
@@ -308,9 +305,29 @@ private:
                     tail_entry.caller_func = std::move(from_func);
                     tail_entry.callee_func = std::move(to_func);
                     tail_entry.is_tail_call = true;
+                    tail_entry.is_fall_through = false;
                     std::copy(accumulated_events, accumulated_events + MAX_EVENTS, tail_entry.events_at_entry);
                     call_stack.push(std::move(tail_entry));
                 }
+                break;
+            }
+            
+            case BranchType::FALL_THROUGH: {
+                // Record fall-through as a special type of call
+                auto& call_info = calls[from_pc][to_pc];
+                ++call_info.count;
+                call_info.is_fall_through = true;  // Mark as fall-through
+                
+                // Push to call stack (treat like a normal call for cost tracking)
+                CallStackEntry entry;
+                entry.caller_pc = from_pc;
+                entry.callee_pc = to_pc;
+                entry.caller_func = std::move(from_func);
+                entry.callee_func = std::move(to_func);
+                entry.is_tail_call = false;
+                entry.is_fall_through = true;
+                std::copy(accumulated_events, accumulated_events + MAX_EVENTS, entry.events_at_entry);
+                call_stack.push(std::move(entry));
                 break;
             }
             
@@ -557,37 +574,40 @@ public:
             }
             out << "\n";
             
-            // Output calls (but skip calls to/from compiler helpers)
-            auto call_it = calls.find(pc);
-            if (call_it != calls.end()) {
-                for (const auto& [target_pc, call_info] : call_it->second) {
-                    auto callee_it = info.find(target_pc);
-                    if (callee_it != info.end()) {
-                        // Skip calls to compiler helpers
-                        if (isCompilerHelper(callee_it->second.func_type)) {
-                            continue;
+            // Output calls (skip calls FROM helper functions, but show calls TO helpers)
+            if (!isCompilerHelper(pc_info.func_type)) {
+                auto call_it = calls.find(pc);
+                if (call_it != calls.end()) {
+                    for (const auto& [target_pc, call_info] : call_it->second) {
+                        auto callee_it = info.find(target_pc);
+                        if (callee_it != info.end()) {
+                            // Output all calls including to helpers
+                            out << "cfn=" << callee_it->second.func;
+                            if (call_info.is_fall_through) {
+                                out << " [fall-through]";  // Mark fall-through calls
+                            }
+                            out << "\n"
+                                << "cfl=" << callee_it->second.file << "\n";
+                        } else {
+                            out << "cfn=unknown\n";
                         }
-                        out << "cfn=" << callee_it->second.func << "\n"
-                            << "cfl=" << callee_it->second.file << "\n";
-                    } else {
-                        out << "cfn=unknown\n";
+                        
+                        out << "calls=" << call_info.count << " ";
+                        if (dump_instr) {
+                            out << "0x" << std::hex << target_pc << std::dec;
+                        }
+                        out << " " << (callee_it != info.end() ? callee_it->second.line : 0) << "\n";
+                        
+                        // Inclusive costs
+                        if (dump_instr) {
+                            out << "0x" << std::hex << pc << std::dec;
+                        }
+                        out << " " << pc_info.line;
+                        for (size_t i = 0; i < num_events; ++i) {
+                            out << " " << call_info.inclusive_events[i];
+                        }
+                        out << "\n";
                     }
-                    
-                    out << "calls=" << call_info.count << " ";
-                    if (dump_instr) {
-                        out << "0x" << std::hex << target_pc << std::dec;
-                    }
-                    out << " " << (callee_it != info.end() ? callee_it->second.line : 0) << "\n";
-                    
-                    // Inclusive costs
-                    if (dump_instr) {
-                        out << "0x" << std::hex << pc << std::dec;
-                    }
-                    out << " " << pc_info.line;
-                    for (size_t i = 0; i < num_events; ++i) {
-                        out << " " << call_info.inclusive_events[i];
-                    }
-                    out << "\n";
                 }
             }
             
