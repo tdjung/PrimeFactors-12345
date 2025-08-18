@@ -128,6 +128,12 @@ private:
     }
 
 public:
+    // 상태 코드 정의
+    static constexpr int SUCCESS = 0;
+    static constexpr int ERROR_INVALID_ADDRESS = -1;
+    static constexpr int ERROR_INVALID_SIZE = -2;
+    static constexpr int ERROR_MISALIGNED = -3;
+
     RegisterArray() : reg_{} {}
 
     // 직접 인덱스 접근 (16비트 단위)
@@ -144,110 +150,180 @@ public:
         return RegisterAccessor<RegisterArray>(*this, addr);
     }
 
-    // === 레지스터 전용 바이트/워드 접근 ===
+    // === 최적화된 원자적 접근 함수들 ===
     
-    // 1바이트 읽기 (최고 성능)
-    [[nodiscard]] inline uint8_t read_byte(size_t byte_addr) const noexcept {
+    // 1바이트 읽기 (포인터 방식)
+    [[nodiscard]] inline int read_byte(size_t byte_addr, uint8_t* value) const noexcept {
+        // 널 포인터 체크
+        if (__builtin_expect(value == nullptr, 0)) [[unlikely]] 
+            return ERROR_INVALID_ADDRESS;
+            
         // 범위 체크
-        if (__builtin_expect(byte_addr >= N * REGISTER_BYTE_WIDTH, 0)) [[unlikely]] return 0;
+        if (__builtin_expect(byte_addr >= N * REGISTER_BYTE_WIDTH, 0)) [[unlikely]] 
+            return ERROR_INVALID_ADDRESS;
         
-        // 직접 메모리 접근 (memcpy보다 빠름)
+        // 직접 메모리 접근 (최고 성능)
         const uint8_t* byte_ptr = reinterpret_cast<const uint8_t*>(reg_.data());
-        return byte_ptr[byte_addr];
+        *value = byte_ptr[byte_addr];
+        return SUCCESS;
     }
     
-    // 1바이트 쓰기 (최고 성능)
-    inline void write_byte(size_t byte_addr, uint8_t value) noexcept {
+    // 1바이트 쓰기 (포인터 방식)
+    [[nodiscard]] inline int write_byte(size_t byte_addr, const uint8_t* value) noexcept {
+        // 널 포인터 체크
+        if (__builtin_expect(value == nullptr, 0)) [[unlikely]] 
+            return ERROR_INVALID_ADDRESS;
+            
         // 범위 체크
-        if (__builtin_expect(byte_addr >= N * REGISTER_BYTE_WIDTH, 0)) [[unlikely]] return;
+        if (__builtin_expect(byte_addr >= N * REGISTER_BYTE_WIDTH, 0)) [[unlikely]] 
+            return ERROR_INVALID_ADDRESS;
         
-        // 직접 메모리 접근 (memcpy보다 빠름)
+        // 직접 메모리 접근 (최고 성능)
         uint8_t* byte_ptr = reinterpret_cast<uint8_t*>(reg_.data());
-        byte_ptr[byte_addr] = value;
+        byte_ptr[byte_addr] = *value;
+        return SUCCESS;
     }
     
-    // 2바이트 읽기 (정렬된 접근만)
-    [[nodiscard]] inline uint16_t read_word(size_t byte_addr) const noexcept {
-        // 정렬 및 범위 체크
-        if (__builtin_expect(byte_addr >= N * REGISTER_BYTE_WIDTH || 
-                           byte_addr % ALIGNMENT_BYTES != 0, 0)) [[unlikely]] return 0;
+    // 2바이트 읽기 (포인터 방식, 정렬된 접근만)
+    [[nodiscard]] inline int read_word(size_t byte_addr, uint16_t* value) const noexcept {
+        // 널 포인터 체크
+        if (__builtin_expect(value == nullptr, 0)) [[unlikely]] 
+            return ERROR_INVALID_ADDRESS;
+            
+        // 정렬 체크
+        if (__builtin_expect(byte_addr % ALIGNMENT_BYTES != 0, 0)) [[unlikely]] 
+            return ERROR_MISALIGNED;
+            
+        // 범위 체크
+        if (__builtin_expect(byte_addr >= N * REGISTER_BYTE_WIDTH, 0)) [[unlikely]] 
+            return ERROR_INVALID_ADDRESS;
         
         const size_t reg_index = byte_addr / REGISTER_BYTE_WIDTH;
-        return reg_[reg_index];
+        *value = reg_[reg_index];
+        return SUCCESS;
     }
     
-    // 2바이트 쓰기 (정렬된 접근만)
-    inline void write_word(size_t byte_addr, uint16_t value) noexcept {
-        // 정렬 및 범위 체크
-        if (__builtin_expect(byte_addr >= N * REGISTER_BYTE_WIDTH || 
-                           byte_addr % ALIGNMENT_BYTES != 0, 0)) [[unlikely]] return;
+    // 2바이트 쓰기 (포인터 방식, 정렬된 접근만)
+    [[nodiscard]] inline int write_word(size_t byte_addr, const uint16_t* value) noexcept {
+        // 널 포인터 체크
+        if (__builtin_expect(value == nullptr, 0)) [[unlikely]] 
+            return ERROR_INVALID_ADDRESS;
+            
+        // 정렬 체크
+        if (__builtin_expect(byte_addr % ALIGNMENT_BYTES != 0, 0)) [[unlikely]] 
+            return ERROR_MISALIGNED;
+            
+        // 범위 체크
+        if (__builtin_expect(byte_addr >= N * REGISTER_BYTE_WIDTH, 0)) [[unlikely]] 
+            return ERROR_INVALID_ADDRESS;
         
         const size_t reg_index = byte_addr / REGISTER_BYTE_WIDTH;
-        reg_[reg_index] = value;
+        reg_[reg_index] = *value;
+        return SUCCESS;
     }
     
-    // === 통합 read/write 인터페이스 (1바이트 또는 2바이트만) ===
+    // === 통합 read/write 인터페이스 (크기별 자동 선택) ===
     
     // 레지스터 전용 읽기 (크기: 1 또는 2바이트만)
-    inline void read(size_t byte_addr, void* data_ptr, size_t req_size) const noexcept {
+    [[nodiscard]] inline int read(size_t byte_addr, void* data_ptr, size_t req_size) const noexcept {
+        // 널 포인터 체크
+        if (__builtin_expect(data_ptr == nullptr, 0)) [[unlikely]] 
+            return ERROR_INVALID_ADDRESS;
+            
         // 레지스터는 1바이트 또는 2바이트만 허용
-        if (__builtin_expect(req_size != 1 && req_size != ALIGNMENT_BYTES, 0)) [[unlikely]] return;
+        if (__builtin_expect(req_size != 1 && req_size != ALIGNMENT_BYTES, 0)) [[unlikely]] 
+            return ERROR_INVALID_SIZE;
         
         if (req_size == 1) {
-            // 1바이트: direct access가 가장 빠름
-            *static_cast<uint8_t*>(data_ptr) = read_byte(byte_addr);
+            // 1바이트: 최적화된 direct access
+            return read_byte(byte_addr, static_cast<uint8_t*>(data_ptr));
         } else {
             // 2바이트: 정렬된 워드 접근
-            if (__builtin_expect(byte_addr % ALIGNMENT_BYTES == 0, 1)) [[likely]] {
-                *static_cast<uint16_t*>(data_ptr) = read_word(byte_addr);
-            }
-            // 정렬되지 않은 2바이트 접근은 불허
+            return read_word(byte_addr, static_cast<uint16_t*>(data_ptr));
         }
     }
     
     // 레지스터 전용 쓰기 (크기: 1 또는 2바이트만)
-    inline void write(size_t byte_addr, const void* data_ptr, size_t req_size) noexcept {
+    [[nodiscard]] inline int write(size_t byte_addr, const void* data_ptr, size_t req_size) noexcept {
+        // 널 포인터 체크
+        if (__builtin_expect(data_ptr == nullptr, 0)) [[unlikely]] 
+            return ERROR_INVALID_ADDRESS;
+            
         // 레지스터는 1바이트 또는 2바이트만 허용
-        if (__builtin_expect(req_size != 1 && req_size != ALIGNMENT_BYTES, 0)) [[unlikely]] return;
+        if (__builtin_expect(req_size != 1 && req_size != ALIGNMENT_BYTES, 0)) [[unlikely]] 
+            return ERROR_INVALID_SIZE;
         
         if (req_size == 1) {
-            // 1바이트: direct access가 가장 빠름
-            write_byte(byte_addr, *static_cast<const uint8_t*>(data_ptr));
+            // 1바이트: 최적화된 direct access
+            return write_byte(byte_addr, static_cast<const uint8_t*>(data_ptr));
         } else {
             // 2바이트: 정렬된 워드 접근
-            if (__builtin_expect(byte_addr % ALIGNMENT_BYTES == 0, 1)) [[likely]] {
-                write_word(byte_addr, *static_cast<const uint16_t*>(data_ptr));
-            }
-            // 정렬되지 않은 2바이트 접근은 불허
+            return write_word(byte_addr, static_cast<const uint16_t*>(data_ptr));
         }
     }
     
-    // 템플릿 기반 타입 안전 인터페이스
+    // === 편의성을 위한 템플릿 인터페이스 ===
+    
+    // 타입 안전 읽기 (참조 방식으로 깔끔함)
     template<typename T>
-    [[nodiscard]] inline T read_as(size_t byte_addr) const noexcept {
-        static_assert(sizeof(T) == 1 || sizeof(T) == 2, "Only 1 or 2 byte types allowed for registers");
+    [[nodiscard]] inline int read_as(size_t byte_addr, T& value) const noexcept {
+        static_assert(sizeof(T) == 1 || sizeof(T) == 2, "Only 1 or 2 byte types allowed");
         
         if constexpr (sizeof(T) == 1) {
-            return static_cast<T>(read_byte(byte_addr));
+            return read_byte(byte_addr, reinterpret_cast<uint8_t*>(&value));
         } else {
-            return static_cast<T>(read_word(byte_addr));
+            return read_word(byte_addr, reinterpret_cast<uint16_t*>(&value));
         }
     }
     
+    // 타입 안전 쓰기 (값 방식으로 편리함)
     template<typename T>
-    inline void write_as(size_t byte_addr, T value) noexcept {
-        static_assert(sizeof(T) == 1 || sizeof(T) == 2, "Only 1 or 2 byte types allowed for registers");
+    [[nodiscard]] inline int write_as(size_t byte_addr, const T& value) noexcept {
+        static_assert(sizeof(T) == 1 || sizeof(T) == 2, "Only 1 or 2 byte types allowed");
         
         if constexpr (sizeof(T) == 1) {
-            write_byte(byte_addr, static_cast<uint8_t>(value));
+            return write_byte(byte_addr, reinterpret_cast<const uint8_t*>(&value));
         } else {
-            write_word(byte_addr, static_cast<uint16_t>(value));
+            return write_word(byte_addr, reinterpret_cast<const uint16_t*>(&value));
         }
+    }
+    
+    // === 편의성 함수들 (기존 방식 호환) ===
+    
+    // 간편한 직접 값 읽기 (에러 시 기본값 반환)
+    [[nodiscard]] inline uint8_t read_byte_safe(size_t byte_addr, uint8_t default_value = 0) const noexcept {
+        uint8_t value;
+        return (read_byte(byte_addr, &value) == SUCCESS) ? value : default_value;
+    }
+    
+    [[nodiscard]] inline uint16_t read_word_safe(size_t byte_addr, uint16_t default_value = 0) const noexcept {
+        uint16_t value;
+        return (read_word(byte_addr, &value) == SUCCESS) ? value : default_value;
+    }
+    
+    // 간편한 직접 값 쓰기 (bool 반환)
+    [[nodiscard]] inline bool write_byte_simple(size_t byte_addr, uint8_t value) noexcept {
+        return write_byte(byte_addr, &value) == SUCCESS;
+    }
+    
+    [[nodiscard]] inline bool write_word_simple(size_t byte_addr, uint16_t value) noexcept {
+        return write_word(byte_addr, &value) == SUCCESS;
     }
     
     // 정렬 상태 확인 헬퍼 함수
     [[nodiscard]] static constexpr bool is_aligned(size_t byte_addr, size_t req_size) noexcept {
         return (req_size == 1) || (byte_addr % ALIGNMENT_BYTES == 0 && req_size == ALIGNMENT_BYTES);
+    }
+    
+    // 에러 코드를 문자열로 변환
+    [[nodiscard]] static constexpr const char* error_string(int error_code) noexcept {
+        switch (error_code) {
+            case SUCCESS: return "Success";
+            case ERROR_INVALID_ADDRESS: return "Invalid address";
+            case ERROR_INVALID_SIZE: return "Invalid size";
+            case ERROR_MISALIGNED: return "Misaligned access";
+            default: return "Unknown error";
+        }
     }
 
     // 기본 메서드들
