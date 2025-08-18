@@ -155,11 +155,11 @@ public:
     // 1바이트 읽기 (포인터 방식)
     [[nodiscard]] inline int read_byte(size_t byte_addr, uint8_t* value) const noexcept {
         // 널 포인터 체크
-        if (__builtin_expect(value == nullptr, 0)) [[unlikely]] 
+        if (value == nullptr) [[unlikely]] 
             return ERROR_INVALID_ADDRESS;
             
         // 범위 체크
-        if (__builtin_expect(byte_addr >= N * REGISTER_BYTE_WIDTH, 0)) [[unlikely]] 
+        if (byte_addr >= N * REGISTER_BYTE_WIDTH) [[unlikely]] 
             return ERROR_INVALID_ADDRESS;
         
         // 직접 메모리 접근 (최고 성능)
@@ -171,11 +171,11 @@ public:
     // 1바이트 쓰기 (포인터 방식)
     [[nodiscard]] inline int write_byte(size_t byte_addr, const uint8_t* value) noexcept {
         // 널 포인터 체크
-        if (__builtin_expect(value == nullptr, 0)) [[unlikely]] 
+        if (value == nullptr) [[unlikely]] 
             return ERROR_INVALID_ADDRESS;
             
         // 범위 체크
-        if (__builtin_expect(byte_addr >= N * REGISTER_BYTE_WIDTH, 0)) [[unlikely]] 
+        if (byte_addr >= N * REGISTER_BYTE_WIDTH) [[unlikely]] 
             return ERROR_INVALID_ADDRESS;
         
         // 직접 메모리 접근 (최고 성능)
@@ -187,15 +187,15 @@ public:
     // 2바이트 읽기 (포인터 방식, 정렬된 접근만)
     [[nodiscard]] inline int read_word(size_t byte_addr, uint16_t* value) const noexcept {
         // 널 포인터 체크
-        if (__builtin_expect(value == nullptr, 0)) [[unlikely]] 
+        if (value == nullptr) [[unlikely]] 
             return ERROR_INVALID_ADDRESS;
             
         // 정렬 체크
-        if (__builtin_expect(byte_addr % ALIGNMENT_BYTES != 0, 0)) [[unlikely]] 
+        if (byte_addr % ALIGNMENT_BYTES != 0) [[unlikely]] 
             return ERROR_MISALIGNED;
             
         // 범위 체크
-        if (__builtin_expect(byte_addr >= N * REGISTER_BYTE_WIDTH, 0)) [[unlikely]] 
+        if (byte_addr >= N * REGISTER_BYTE_WIDTH) [[unlikely]] 
             return ERROR_INVALID_ADDRESS;
         
         const size_t reg_index = byte_addr / REGISTER_BYTE_WIDTH;
@@ -206,15 +206,15 @@ public:
     // 2바이트 쓰기 (포인터 방식, 정렬된 접근만)
     [[nodiscard]] inline int write_word(size_t byte_addr, const uint16_t* value) noexcept {
         // 널 포인터 체크
-        if (__builtin_expect(value == nullptr, 0)) [[unlikely]] 
+        if (value == nullptr) [[unlikely]] 
             return ERROR_INVALID_ADDRESS;
             
         // 정렬 체크
-        if (__builtin_expect(byte_addr % ALIGNMENT_BYTES != 0, 0)) [[unlikely]] 
+        if (byte_addr % ALIGNMENT_BYTES != 0) [[unlikely]] 
             return ERROR_MISALIGNED;
             
         // 범위 체크
-        if (__builtin_expect(byte_addr >= N * REGISTER_BYTE_WIDTH, 0)) [[unlikely]] 
+        if (byte_addr >= N * REGISTER_BYTE_WIDTH) [[unlikely]] 
             return ERROR_INVALID_ADDRESS;
         
         const size_t reg_index = byte_addr / REGISTER_BYTE_WIDTH;
@@ -227,11 +227,11 @@ public:
     // 레지스터 전용 읽기 (크기: 1 또는 2바이트만)
     [[nodiscard]] inline int read(size_t byte_addr, void* data_ptr, size_t req_size) const noexcept {
         // 널 포인터 체크
-        if (__builtin_expect(data_ptr == nullptr, 0)) [[unlikely]] 
+        if (data_ptr == nullptr) [[unlikely]] 
             return ERROR_INVALID_ADDRESS;
             
         // 레지스터는 1바이트 또는 2바이트만 허용
-        if (__builtin_expect(req_size != 1 && req_size != ALIGNMENT_BYTES, 0)) [[unlikely]] 
+        if (req_size != 1 && req_size != ALIGNMENT_BYTES) [[unlikely]] 
             return ERROR_INVALID_SIZE;
         
         if (req_size == 1) {
@@ -246,11 +246,11 @@ public:
     // 레지스터 전용 쓰기 (크기: 1 또는 2바이트만)
     [[nodiscard]] inline int write(size_t byte_addr, const void* data_ptr, size_t req_size) noexcept {
         // 널 포인터 체크
-        if (__builtin_expect(data_ptr == nullptr, 0)) [[unlikely]] 
+        if (data_ptr == nullptr) [[unlikely]] 
             return ERROR_INVALID_ADDRESS;
             
         // 레지스터는 1바이트 또는 2바이트만 허용
-        if (__builtin_expect(req_size != 1 && req_size != ALIGNMENT_BYTES, 0)) [[unlikely]] 
+        if (req_size != 1 && req_size != ALIGNMENT_BYTES) [[unlikely]] 
             return ERROR_INVALID_SIZE;
         
         if (req_size == 1) {
@@ -336,101 +336,181 @@ public:
     const uint8_t* byte_ptr() const noexcept { return reinterpret_cast<const uint8_t*>(reg_.data()); }
 };
 
-// === 레지스터 전용 최적화 사용 예제 ===
+// === 상태 코드 기반 레지스터 접근 사용 예제 ===
 int main() {
     RegisterArray<10> registers;
     
-    // === 레지스터 전용 최적화된 접근 ===
+    // === 기본 상태 코드 기반 접근 ===
     
-    // 1. 1바이트 접근 (모든 주소 가능)
-    registers.write_byte(0x1000, 0xAB);     // 하위 바이트
-    registers.write_byte(0x1001, 0xCD);     // 상위 바이트
+    // 1. 1바이트 읽기/쓰기 (상태 코드 반환)
+    uint8_t byte_value;
+    int result = registers.read_byte(0x1000, &byte_value);
+    if (result == RegisterArray<10>::SUCCESS) {
+        std::cout << "Read successful: 0x" << std::hex << byte_value << std::endl;
+    } else {
+        std::cout << "Read failed: " << registers.error_string(result) << std::endl;
+    }
     
-    uint8_t low = registers.read_byte(0x1000);   // 0xAB
-    uint8_t high = registers.read_byte(0x1001);  // 0xCD
+    uint8_t write_data = 0xAB;
+    result = registers.write_byte(0x1001, &write_data);
+    if (result == RegisterArray<10>::SUCCESS) {
+        std::cout << "Write successful" << std::endl;
+    }
     
-    // 2. 2바이트 접근 (짝수 주소만)
-    registers.write_word(0x1002, 0x1234);
-    uint16_t word = registers.read_word(0x1002); // 0x1234
+    // 2. 2바이트 읽기/쓰기 (정렬 체크 포함)
+    uint16_t word_value;
+    result = registers.read_word(0x1002, &word_value);  // 짝수 주소
+    if (result == RegisterArray<10>::SUCCESS) {
+        std::cout << "Word read: 0x" << std::hex << word_value << std::endl;
+    }
     
-    // 3. 통합 인터페이스 (크기별 자동 최적화)
-    uint8_t byte_data = 0xFF;
-    registers.write(0x1004, &byte_data, 1);     // → write_byte() 호출
+    uint16_t write_word = 0x1234;
+    result = registers.write_word(0x1003, &write_word);  // 홀수 주소 - 정렬 에러!
+    if (result == RegisterArray<10>::ERROR_MISALIGNED) {
+        std::cout << "Expected misalignment error occurred" << std::endl;
+    }
     
-    uint16_t word_data = 0x5678;
-    registers.write(0x1006, &word_data, 2);     // → write_word() 호출
+    // === 통합 인터페이스 사용 ===
     
-    uint8_t read_byte;
-    registers.read(0x1004, &read_byte, 1);      // → read_byte() 호출
+    // 3. 크기별 자동 선택
+    uint8_t data1 = 0xFF;
+    result = registers.write(0x1004, &data1, 1);  // 1바이트 → write_byte 호출
     
-    uint16_t read_word;
-    registers.read(0x1006, &read_word, 2);      // → read_word() 호출
+    uint16_t data2 = 0x5678;
+    result = registers.write(0x1006, &data2, 2);  // 2바이트 → write_word 호출
     
-    // 4. 타입 안전 템플릿 인터페이스
-    registers.write_as<uint8_t>(0x1008, 0xEF);
-    registers.write_as<uint16_t>(0x100A, 0x9ABC);
+    uint8_t read_data1;
+    uint16_t read_data2;
+    registers.read(0x1004, &read_data1, 1);      // 1바이트 읽기
+    registers.read(0x1006, &read_data2, 2);      // 2바이트 읽기
     
-    uint8_t safe_byte = registers.read_as<uint8_t>(0x1008);   // 0xEF
-    uint16_t safe_word = registers.read_as<uint16_t>(0x100A); // 0x9ABC
+    // === 템플릿 기반 타입 안전 접근 ===
     
-    // === 16비트 레지스터 비트 조작 ===
+    // 4. 참조 방식으로 깔끔한 읽기
+    uint8_t byte_val;
+    uint16_t word_val;
+    
+    result = registers.read_as(0x1008, byte_val);   // 타입 자동 추론
+    if (result == RegisterArray<10>::SUCCESS) {
+        std::cout << "Type-safe read: " << static_cast<int>(byte_val) << std::endl;
+    }
+    
+    result = registers.read_as(0x100A, word_val);
+    
+    // 5. 값 방식으로 편리한 쓰기
+    result = registers.write_as(0x100C, static_cast<uint8_t>(0xCD));
+    result = registers.write_as(0x100E, static_cast<uint16_t>(0x9ABC));
+    
+    // === 편의성 함수들 ===
+    
+    // 6. 에러 시 기본값 반환 (간단한 경우)
+    uint8_t safe_val = registers.read_byte_safe(0x1010, 0xFF);  // 에러 시 0xFF 반환
+    uint16_t safe_word = registers.read_word_safe(0x1012, 0xDEAD);
+    
+    // 7. bool 반환으로 간단한 성공/실패 체크
+    bool write_ok = registers.write_byte_simple(0x1014, 0x42);
+    if (write_ok) {
+        std::cout << "Simple write succeeded" << std::endl;
+    }
+    
+    // === 에러 처리 패턴들 ===
+    
+    // 8. 상세한 에러 처리
+    auto handle_register_error = [&](int error_code, const char* operation) {
+        if (error_code != RegisterArray<10>::SUCCESS) {
+            std::cerr << "Register " << operation << " failed: " 
+                     << registers.error_string(error_code) << std::endl;
+            return false;
+        }
+        return true;
+    };
+    
+    uint8_t test_data = 0x55;
+    if (handle_register_error(registers.write_byte(0x1016, &test_data), "write")) {
+        uint8_t verify_data;
+        if (handle_register_error(registers.read_byte(0x1016, &verify_data), "read")) {
+            assert(verify_data == test_data);
+            std::cout << "Write-verify cycle successful" << std::endl;
+        }
+    }
+    
+    // 9. 배치 처리
+    struct RegisterWrite {
+        size_t addr;
+        uint8_t value;
+    };
+    
+    RegisterWrite writes[] = {
+        {0x1018, 0x11}, {0x1019, 0x22}, {0x101A, 0x33}
+    };
+    
+    bool all_success = true;
+    for (const auto& write : writes) {
+        int result = registers.write_byte(write.addr, &write.value);
+        if (result != RegisterArray<10>::SUCCESS) {
+            std::cerr << "Batch write failed at address 0x" << std::hex << write.addr 
+                     << ": " << registers.error_string(result) << std::endl;
+            all_success = false;
+        }
+    }
+    
+    if (all_success) {
+        std::cout << "Batch write completed successfully" << std::endl;
+    }
+    
+    // === 16비트 레지스터 비트 조작은 그대로 ===
     
     registers.reg(RegAddr::ABC) = 0x1234;
     registers.reg(RegAddr::ABC).set_bit<5>();
     uint16_t field = registers.reg(RegAddr::ABC).bits<7,4>();
     
-    // === 실제 레지스터 사용 시나리오 ===
+    // === 성능 및 에러 처리 혼합 사용 ===
     
-    // 시나리오 1: 상태 레지스터 개별 바이트 처리
-    registers.write_byte(0x1000, 0x80);  // 상태 플래그
-    registers.write_byte(0x1001, 0x03);  // 제어 플래그
-    
-    if (registers.read_byte(0x1000) & 0x80) {
-        // 특정 상태 체크
+    // 성능이 중요한 루프에서는 safe 버전 사용
+    for (int i = 0; i < 100; ++i) {
+        uint8_t data = static_cast<uint8_t>(i);
+        if (!registers.write_byte_simple(0x1000 + (i % 20), data)) {
+            std::cerr << "Write failed in performance loop at iteration " << i << std::endl;
+            break;
+        }
     }
     
-    // 시나리오 2: 설정 레지스터 워드 단위 처리
-    uint16_t config = 0x1234;
-    registers.write_word(0x1010, config);
-    
-    uint16_t current_config = registers.read_word(0x1010);
-    
-    // 시나리오 3: 타입별 안전한 접근
-    enum class StatusByte : uint8_t { IDLE = 0, BUSY = 1, ERROR = 2 };
-    enum class ConfigWord : uint16_t { DEFAULT = 0x1000, TURBO = 0x2000 };
-    
-    registers.write_as(0x1020, StatusByte::BUSY);
-    registers.write_as(0x1022, ConfigWord::TURBO);
-    
-    StatusByte status = registers.read_as<StatusByte>(0x1020);
-    ConfigWord config_mode = registers.read_as<ConfigWord>(0x1022);
+    // 신뢰성이 중요한 곳에서는 상세한 에러 체크
+    uint16_t critical_data = 0xCAFE;
+    int critical_result = registers.write_word(0x1000, &critical_data);
+    if (critical_result != RegisterArray<10>::SUCCESS) {
+        std::cerr << "Critical write failed: " << registers.error_string(critical_result) << std::endl;
+        // 에러 복구 로직...
+        return -1;
+    }
     
     return 0;
 }
 
 /*
-=== 레지스터 전용 최적화 요약 ===
+=== 새로운 상태 코드 기반 설계 요약 ===
 
 🎯 핵심 개선사항:
-1. 대용량 접근 로직 완전 제거 (size > 2 불허)
-2. 1바이트/2바이트만 고려한 단순하고 빠른 구조
-3. 레지스터 특성에 맞는 타입 안전 인터페이스
+1. 명확한 에러 처리: 상태 코드로 실패 원인 구분
+2. 포인터 기반 인터페이스: read/write 일관성 유지
+3. 다양한 편의성 레벨: 성능 vs 편의성 선택 가능
+4. 타입 안전성: 템플릿으로 컴파일 타임 체크
 
-⚡ 성능 특성:
-- 1바이트: direct memory access (최고 성능)
-- 2바이트: direct register access (최고 성능)
-- 복잡한 분기 제거로 예측 가능한 성능
-- memcpy 오버헤드 완전 제거
+📊 성능 특성:
+- 기본 함수들: 포인터 역참조 1회 + 직접 메모리 접근
+- 템플릿 함수들: 컴파일 타임 최적화로 동일한 성능
+- 편의성 함수들: 약간의 오버헤드로 사용성 향상
+- 에러 체크: [[unlikely]]로 성능 영향 최소화
 
-🔧 사용법:
-- write_byte/read_byte: 1바이트 직접 접근
-- write_word/read_word: 2바이트 정렬된 접근
-- write/read: 크기별 자동 선택
-- write_as/read_as: 타입 안전 접근
+🔧 사용 패턴:
+- 성능 중심: write_byte_simple(), read_byte_safe()
+- 신뢰성 중심: write_byte() + 상태 코드 체크
+- 타입 안전: read_as(), write_as() 템플릿
+- 배치 처리: 배열 + 에러 누적 체크
 
 🎉 결과:
-- 코드 복잡도 대폭 감소
-- 성능 예측 가능성 증가  
-- 레지스터 용도에 완벽 최적화
-- 타입 안전성 강화
+- 명확한 에러 처리 + 기존 성능 유지
+- 다양한 사용 시나리오 지원
+- C 스타일 에러 처리와 현대 C++ 융합
+- 디버깅 및 유지보수성 대폭 향상
 */
