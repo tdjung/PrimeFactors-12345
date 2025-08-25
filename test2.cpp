@@ -35,8 +35,7 @@ enum class BranchType {
     INDIRECT_JUMP,    // Indirect jump
     CALL,             // Function call
     RETURN,           // Function return
-    TAIL_CALL,        // Tail call
-    FALL_THROUGH      // Fall-through to next function
+    TAIL_CALL         // Tail call
 };
 
 // Function type for optimization
@@ -65,9 +64,8 @@ struct PCInfo {
 struct CallTargetInfo {
     uint64_t count;
     uint64_t inclusive_events[MAX_EVENTS];
-    bool is_fall_through;  // Track if this is a fall-through
     
-    CallTargetInfo() : count(0), is_fall_through(false) {
+    CallTargetInfo() : count(0) {
         std::fill(std::begin(inclusive_events), std::end(inclusive_events), 0);
     }
 };
@@ -92,7 +90,6 @@ struct CallStackEntry {
     std::string callee_func;
     uint64_t events_at_entry[MAX_EVENTS];
     bool is_tail_call;
-    bool is_fall_through;  // Track if this was a fall-through entry
 };
 
 class CallgrindGenerator {
@@ -112,7 +109,6 @@ private:
     bool last_was_branch;
     uint32_t last_inst_size;
     uint64_t accumulated_events[MAX_EVENTS];
-    std::string last_func_name;  // Track last function name for fall-through detection
     
     // Track the real caller when in compiler helper functions
     uint64_t real_caller_pc;
@@ -188,12 +184,6 @@ private:
             if (isRestoreHelper(from_type) && isRestoreHelper(to_type) && is_sequential) {
                 return BranchType::NONE;  // Internal flow within helpers
             }
-        }
-        
-        // Check for function fall-through (sequential execution across function boundary)
-        if (is_sequential && from_info.func != to_info.func && !isCompilerHelper(from_type)) {
-            // This is a fall-through from one function to another
-            return BranchType::FALL_THROUGH;
         }
         
         // Check for calls to compiler helpers
@@ -283,7 +273,6 @@ private:
                 entry.caller_func = from_func;
                 entry.callee_func = to_func;
                 entry.is_tail_call = false;
-                entry.is_fall_through = false;
                 std::copy(accumulated_events, accumulated_events + MAX_EVENTS, entry.events_at_entry);
                 call_stack.push(entry);
                 
@@ -314,29 +303,9 @@ private:
                     tail_entry.caller_func = from_func;
                     tail_entry.callee_func = to_func;
                     tail_entry.is_tail_call = true;
-                    tail_entry.is_fall_through = false;
                     std::copy(accumulated_events, accumulated_events + MAX_EVENTS, tail_entry.events_at_entry);
                     call_stack.push(tail_entry);
                 }
-                break;
-            }
-            
-            case BranchType::FALL_THROUGH: {
-                // Record fall-through as a special type of call
-                auto& call_info = calls[from_pc][to_pc];
-                ++call_info.count;
-                call_info.is_fall_through = true;  // Mark as fall-through
-                
-                // Push to call stack (treat like a normal call for cost tracking)
-                CallStackEntry entry;
-                entry.caller_pc = from_pc;
-                entry.callee_pc = to_pc;
-                entry.caller_func = from_func;
-                entry.callee_func = to_func;
-                entry.is_tail_call = false;
-                entry.is_fall_through = true;
-                std::copy(accumulated_events, accumulated_events + MAX_EVENTS, entry.events_at_entry);
-                call_stack.push(entry);
                 break;
             }
             
@@ -434,8 +403,7 @@ public:
           branch_sim(true),
           collect_jumps(true),
           num_events(2),
-          real_caller_pc(0),
-          last_func_name("") {
+          real_caller_pc(0) {
         
         event_names = {"Ir", "Cycle", "Bc", "Bcm", "Bi", "Bim"};
         std::fill(accumulated_events, accumulated_events + MAX_EVENTS, 0);
@@ -479,23 +447,15 @@ public:
             it = info.find(pc);  // Update iterator
         }
         
-        // Get current function name
-        std::string current_func = it->second.func;
-        
         // Update events for ALL functions including helpers
         info[pc].event[event_type] += count;
         accumulated_events[event_type] += count;
         
-        // Handle previous branch or function boundary crossing
-        if (last_pc != 0) {
-            bool function_changed = (!last_func_name.empty() && current_func != last_func_name);
-            
-            // Process if it was a branch OR function changed (fall-through detection)
-            if (last_was_branch || function_changed) {
-                bool is_sequential = (pc == last_pc + last_inst_size);
-                BranchType branch_type = detectBranchType(last_pc, pc, last_dest_reg, is_sequential);
-                handleBranch(last_pc, pc, branch_type, is_sequential);
-            }
+        // Handle previous branch
+        if (last_pc != 0 && last_was_branch) {
+            bool is_sequential = (pc == last_pc + last_inst_size);
+            BranchType branch_type = detectBranchType(last_pc, pc, last_dest_reg, is_sequential);
+            handleBranch(last_pc, pc, branch_type, is_sequential);
         }
         
         // Update state
@@ -503,7 +463,6 @@ public:
         last_dest_reg = dest_reg;
         last_was_branch = is_branch_instruction;
         last_inst_size = it->second.assembly.empty() ? 4 : detectInstructionSize(it->second.assembly);
-        last_func_name = current_func;
     }
     
     // Write output
@@ -590,12 +549,7 @@ public:
                     for (const auto& [target_pc, call_info] : call_it->second) {
                         auto callee_it = info.find(target_pc);
                         if (callee_it != info.end()) {
-                            // Output all calls including to helpers
-                            out << "cfn=" << callee_it->second.func;
-                            if (call_info.is_fall_through) {
-                                out << " [fall-through]";  // Mark fall-through calls
-                            }
-                            out << "\n"
+                            out << "cfn=" << callee_it->second.func << "\n"
                                 << "cfl=" << callee_it->second.file << "\n";
                         } else {
                             out << "cfn=unknown\n";
