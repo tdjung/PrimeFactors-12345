@@ -246,10 +246,10 @@ private:
                 std::string original_from_func = from_func;
                 bool used_real_caller = false;
                 
-                // Skip calls FROM compiler helpers (but not TO helpers)
+                // Handle calls FROM save helpers (after prologue)
                 if (isCompilerHelper(from_type)) {
-                    // If calling from save helper, use the real caller
                     if (isSaveHelper(from_type) && !real_caller_func.empty()) {
+                        // Use the real caller for this call
                         from_pc = real_caller_pc;
                         from_func = real_caller_func;
                         used_real_caller = true;
@@ -259,11 +259,10 @@ private:
                     }
                 }
                 
-                // Remember real caller if calling a save helper (use original values)
+                // Remember real caller if calling a save helper
                 if (isSaveHelper(to_type) && !used_real_caller) {
                     real_caller_pc = original_from_pc;
                     real_caller_func = original_from_func;
-                    // But still record the call to the helper!
                 }
                 
                 // Push to call stack
@@ -276,7 +275,7 @@ private:
                 std::copy(accumulated_events, accumulated_events + MAX_EVENTS, entry.events_at_entry);
                 call_stack.push(entry);
                 
-                // Record call
+                // Record call (including to helpers)
                 ++calls[from_pc][to_pc].count;
                 
                 // Clear real_caller if we used it
@@ -293,7 +292,8 @@ private:
                     return;
                 }
                 
-                // Record tail call (including to restore helpers)
+                // Record tail call INCLUDING to restore helpers
+                // This is important for showing A -> restore calls
                 ++calls[from_pc][to_pc].count;
                 
                 if (!call_stack.empty()) {
@@ -323,11 +323,13 @@ private:
                     call_stack.pop();
                     
                     // Handle tail call chain
+                    // This handles cases like B -> A -> restore -> C
+                    // Where A's inclusive should include C's execution
                     if (was_tail_call && !call_stack.empty()) {
                         auto& original_entry = call_stack.top();
                         auto& original_call = calls[original_entry.caller_pc][original_entry.callee_pc];
                         
-                        // Update original call's inclusive costs directly
+                        // Update original call's inclusive costs
                         for (size_t i = 0; i < MAX_EVENTS; ++i) {
                             original_call.inclusive_events[i] += accumulated_events[i] - original_entry.events_at_entry[i];
                         }
@@ -542,7 +544,8 @@ public:
             }
             out << "\n";
             
-            // Output calls (skip calls FROM helper functions, but show calls TO helpers)
+            // Output calls - now includes calls to helpers
+            // Only skip calls FROM helpers (not TO helpers)
             if (!isCompilerHelper(pc_info.func_type)) {
                 auto call_it = calls.find(pc);
                 if (call_it != calls.end()) {
