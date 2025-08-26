@@ -292,8 +292,17 @@ private:
                     return;
                 }
                 
-                // Record tail call INCLUDING to restore helpers
-                // This is important for showing A -> restore calls
+                // Special handling for tail calls TO restore helpers
+                // Don't push to stack - restore helper will handle the return
+                if (isRestoreHelper(to_type)) {
+                    // Record the call for visibility
+                    ++calls[from_pc][to_pc].count;
+                    // But DON'T push to stack - the current function is ending
+                    // The restore helper will return to the original caller
+                    return;
+                }
+                
+                // Normal tail call handling
                 ++calls[from_pc][to_pc].count;
                 
                 if (!call_stack.empty()) {
@@ -323,8 +332,6 @@ private:
                     call_stack.pop();
                     
                     // Handle tail call chain
-                    // This handles cases like B -> A -> restore -> C
-                    // Where A's inclusive should include C's execution
                     if (was_tail_call && !call_stack.empty()) {
                         auto& original_entry = call_stack.top();
                         auto& original_call = calls[original_entry.caller_pc][original_entry.callee_pc];
